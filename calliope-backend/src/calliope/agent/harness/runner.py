@@ -117,7 +117,26 @@ class AgentRunner:
             row = conn.execute(
                 "SELECT * FROM agent_messages WHERE id = ?", (cur.lastrowid,)
             ).fetchone()
-            return row_to_dict(row)
+            out = row_to_dict(row)
+            # Echo the parsed shapes alongside the raw *_json strings, so the
+            # live agent.message SSE row has the same shape as GET
+            # /sessions/{id} rows (which derive from the parsed event log).
+            # AgentChat derives the ask_user question card from
+            # tool_result.options — raw-string rows made the card invisible
+            # until a page reload (PR #49).
+            if out.get("tool_args_json"):
+                try:
+                    out["tool_args"] = json.loads(out["tool_args_json"])
+                except (json.JSONDecodeError, TypeError):
+                    out["tool_args"] = None
+            if out.get("tool_result_json"):
+                try:
+                    out["tool_result"] = json.loads(
+                        out["tool_result_json"], strict=False
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    out["tool_result"] = None
+            return out
         finally:
             conn.close()
 

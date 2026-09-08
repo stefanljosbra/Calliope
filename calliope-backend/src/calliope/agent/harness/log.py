@@ -12,6 +12,7 @@ chats keep working.
 """
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -112,7 +113,14 @@ def append_event(session_id: int, event_type: str, data: dict[str, Any]) -> Sess
             """,
             (session_id, session_id, event_type, json.dumps(data, ensure_ascii=False, default=str)),
         )
-        seq = cur.lastrowid
+        # cur.lastrowid is the table-wide row id, NOT the per-session seq the
+        # INSERT just allocated; read the seq back. Returning the row id made
+        # ask_user hand the card a question_seq that latest_open_question()
+        # (which compares per-session seq) could never match, so a card click
+        # never wrote question/answered once more than one session existed.
+        seq = conn.execute(
+            "SELECT seq FROM agent_events WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()["seq"]
         conn.execute(
             "UPDATE agent_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (session_id,),
@@ -254,15 +262,102 @@ def project_user_content(
     content: str,
     mentions: list[dict[str, Any]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
-) -> str:
-    """User prose plus the Calliope context appendix for the LLM."""
+) -> str | list[dict[str, Any]]:
+    """User prose plus the Calliope context appendix for the LLM.
+
+    Image attachments become OpenAI-style ``image_url`` content parts (data
+    URLs read from disk), so vision-capable models see the actual pixels
+    instead of just a path line. Returns a plain string when there are no
+    usable images (the common text-only case).
+    """
     appendix = format_calliope_context(mentions, attachments)
     prose = (content or "").rstrip()
-    if not appendix:
-        return prose
-    if not prose:
-        return appendix
-    return f"{prose}\n\n{appendix}"
+    text = prose
+    if appendix:
+        text = f"{prose}\n\n{appendix}" if prose else appendix
+
+    image_parts: list[dict[str, Any]] = []
+    for a in attachments or []:
+        if not isinstance(a, dict):
+            continue
+        if str(a.get("kind") or "image") != "image":
+            continue
+        data_url = _image_attachment_data_url(str(a.get("path") or ""))
+        if data_url:
+            image_parts.append(
+                {"type": "image_url", "image_url": {"url": data_url}}
+            )
+    if not image_parts:
+        return text
+
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text or "(see attached image)"}]
+    parts.extend(image_parts)
+    return parts
+
+
+# Images are downscaled before reaching the LLM context — a full-res PNG can
+# be multiple MB of base64, which bloats every subsequent request in the turn.
+_MAX_VISION_IMAGE_BYTES = 512_000
+_VISION_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _image_attachment_data_url(path: str) -> str | None:
+    """Read an attachment image under assets_dir as a downscaled data URL.
+
+    Returns None (silently — the text appendix still names the file) when the
+    path is missing/outside assets_dir, not a known image type, or too large
+    after decoding.
+    """
+    from pathlib import Path
+
+    from calliope.config import settings
+
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    try:
+        target = Path(raw).resolve()
+        target.relative_to(settings.assets_dir.resolve())
+    except (ValueError, OSError):
+        return None
+    mime = _VISION_MIME_BY_EXT.get(target.suffix.lower())
+    if mime is None or not target.is_file():
+        return None
+    try:
+        data = _downscale_image(target, mime)
+    except Exception:
+        return None
+    if not data or len(data) > _MAX_VISION_IMAGE_BYTES:
+        return None
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+def _downscale_image(target: Path, mime: str) -> bytes | None:
+    """Re-encode large images at reduced width; passes small ones through."""
+    data = target.read_bytes()
+    if len(data) <= _MAX_VISION_IMAGE_BYTES:
+        return data
+    try:
+        from PIL import Image
+
+        with Image.open(target) as img:
+            img = img.convert("RGB")
+            width = 1024
+            height = max(1, round(img.height * width / img.width))
+            img = img.resize((width, height))
+            import io
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=82)
+            return buf.getvalue()
+    except Exception:
+        return None
 
 
 def max_turn_number(session_id: int) -> int:

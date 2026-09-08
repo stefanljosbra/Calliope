@@ -1,4 +1,4 @@
-"""Tests for the interaction plugin (ask_user) + structured approvals."""
+﻿"""Tests for the interaction plugin (ask_user) + structured approvals."""
 from __future__ import annotations
 
 import pytest
@@ -134,7 +134,7 @@ def test_denied_tool_result_carries_reason_code(client, session, monkeypatch):
 
     project = client.post("/api/projects", json={"title": "Guard Codes"}).json()
     ctx = ToolContext(session_id=session["id"], project_id=project["id"])
-    # A non-empty project + replace on a destructive tool → destructive guard
+    # A non-empty project + replace on a destructive tool ÔåÆ destructive guard
     registry = get_registry()
     tool = registry.get("generate_story")
     assert tool is not None and tool.destructive
@@ -160,14 +160,187 @@ def test_answer_to_message_records_structured_approval(client, session):
     )
 
     # MessageCreate.answer_to flows through the API the way the card click does.
-    # The turn starts a real run, which needs an LLM — the message is persisted
+    # The turn starts a real run, which needs an LLM ÔÇö the message is persisted
     # regardless; the approval event is what we assert on.
     resp = client.post(
         f"/api/agent/sessions/{session['id']}/messages",
         json={"content": "Yes", "answer_to": asked["question_seq"]},
     )
     # The run may fail fast without an LLM configured; the API contract only
-    # requires the message to be accepted (200) — the answer event must exist.
+    # requires the message to be accepted (200) ÔÇö the answer event must exist.
     assert resp.status_code == 200, resp.text
     assert policy.has_structured_approval(ctx, "render") is True
     assert policy.user_allows_render(ctx) is True
+
+
+def test_card_option_sentence_grants_approval():
+    """Options are full sentences ("Yes, replace with ~40 shorter scenes");
+    the first word decides. Exact 'yes' still grants; 'No, ÔÇª' refuses."""
+    from calliope.agent.harness.policy import _answer_is_affirmative
+
+    assert _answer_is_affirmative("Yes, replace with ~40 shorter scenes") is True
+    assert _answer_is_affirmative("yes go!") is True
+    assert _answer_is_affirmative("Sure, do it") is True
+    assert _answer_is_affirmative("Go ahead") is True
+    assert _answer_is_affirmative("No, keep existing scenes and add more at the end") is False
+    assert _answer_is_affirmative("Just update durations, don't change content") is False
+    assert _answer_is_affirmative("no") is False
+    assert _answer_is_affirmative("") is False
+
+
+def test_ask_user_logs_tool_result_before_turn_end(client, session):
+    """The card derives from the persisted ask_user tool ROW, which needs the
+    tool/result event ÔÇö the loop must log + emit the result BEFORE ending the
+    turn, or the UI shows a stuck 'workingÔÇª' with no question (the reported
+    bug: user had to Stop/refresh to see anything)."""
+    import asyncio
+    import json
+
+    from calliope.agent.harness.loop import run_turn
+
+    class _AskStream:
+        def __aiter__(self):
+            async def gen():
+                yield {
+                    "type": "tool_call",
+                    "tool_call": {
+                        "id": "c1",
+                        "function": {
+                            "name": "ask_user",
+                            "arguments": json.dumps(
+                                {
+                                    "question": "Regenerate the script?",
+                                    "options": ["Yes, replace", "No, keep"],
+                                    "scope": "destructive_replace",
+                                }
+                            ),
+                        },
+                    },
+                }
+
+            return gen()
+
+    class _Client:
+        def chat_stream(self, messages, temperature=0.4, tools=None):
+            return _AskStream()
+
+        async def close(self):
+            return None
+
+    from calliope.agent.harness import loop as loop_mod
+
+    orig_llm = loop_mod._llm_for_role
+    loop_mod._llm_for_role = lambda role: _Client()
+    ctx = ToolContext(session_id=session["id"], project_id=None)
+    try:
+        history: list = []
+        asyncio.run(run_turn(ctx, history, max_iterations=5))
+    finally:
+        loop_mod._llm_for_role = orig_llm
+
+    events = session_log.read_events(session["id"])
+    types = [e.type for e in events]
+    assert session_log.TOOL_RESULT in types, types
+    tr_idx = max(i for i, t in enumerate(types) if t == session_log.TOOL_RESULT)
+    end_idx = max(i for i, t in enumerate(types) if t == session_log.TURN_END)
+    assert tr_idx < end_idx, "tool/result must precede turn/end"
+    tr = events[tr_idx]
+    assert tr.data["tool_name"] == "ask_user"
+    assert tr.data["result"]["options"] == ["Yes, replace", "No, keep"]
+    assert tr.data["result"]["question"] == "Regenerate the script?"
+    end = events[end_idx]
+    assert end.data["status"] == "awaiting_input", end.data
+
+
+def test_append_event_returns_per_session_seq(client, session):
+    """append_event must return the per-session seq it allocated, not the
+    table-wide row id. Once any other session has events the two diverge, and
+    ask_user's question_seq (taken from the returned event) must still match
+    what read_events / latest_open_question report for the same row."""
+    other = client.post("/api/agent/sessions", json={}).json()
+    for i in range(3):
+        session_log.append_event(other["id"], "assistant/message", {"content": f"noise {i}"})
+
+    ev = session_log.append_event(
+        session["id"],
+        session_log.QUESTION_ASKED,
+        {"question": "q?", "options": ["a", "b"], "scope": "info"},
+    )
+    events = session_log.read_events(session["id"])
+    stored = [e for e in events if e.type == session_log.QUESTION_ASKED]
+    assert len(stored) == 1
+    assert ev.seq == stored[0].seq
+    assert interaction.latest_open_question(session["id"])["seq"] == ev.seq
+
+
+def test_card_answer_matches_question_when_other_sessions_exist(client, session):
+    """The card click flow end to end with a second, busier session in the
+    table: question_seq handed to the card must still record question/answered."""
+    import asyncio
+
+    other = client.post("/api/agent/sessions", json={}).json()
+    for i in range(5):
+        session_log.append_event(other["id"], "assistant/message", {"content": f"noise {i}"})
+
+    ctx = ToolContext(session_id=session["id"], project_id=None)
+    asked = asyncio.run(
+        execute_tool(
+            ctx,
+            "ask_user",
+            {"question": "Render now?", "options": ["Yes", "No"], "scope": "render"},
+        )
+    )
+    resp = client.post(
+        f"/api/agent/sessions/{session['id']}/messages",
+        json={"content": "Yes", "answer_to": asked["question_seq"]},
+    )
+    assert resp.status_code == 200, resp.text
+    events = session_log.read_events(session["id"])
+    answered = [e for e in events if e.type == session_log.QUESTION_ANSWERED]
+    assert len(answered) == 1
+    assert answered[0].data["question_seq"] == asked["question_seq"]
+    assert policy.has_structured_approval(ctx, "render") is True
+
+
+
+def test_live_message_echo_carries_parsed_tool_result(client, session):
+    """PR #49: the agent.message SSE echo must carry parsed tool_args /
+    tool_result (same shape as GET rows), or the ask_user card stays hidden
+    until a reload."""
+    from calliope.agent.harness.runner import AgentRunner
+
+    runner = AgentRunner()
+
+    captured: list[dict] = []
+
+    async def fake_publish(event_type, data):
+        if event_type == "agent.message":
+            captured.append(data)
+
+    from calliope.events import bus as bus_mod
+
+    orig_publish = bus_mod.event_bus.publish
+
+    async def publish_capture(event_type, data=None):
+        await fake_publish(event_type, data or {})
+
+    bus_mod.event_bus.publish = publish_capture
+    try:
+        row = runner._persist_message(
+            session["id"],
+            role="tool",
+            content="",
+            tool_name="ask_user",
+            tool_args={"question": "Render?", "options": ["Yes", "No"]},
+            tool_result={"ok": True, "question_seq": 5, "options": ["Yes", "No"], "scope": "render"},
+            append_event=False,
+        )
+    finally:
+        bus_mod.event_bus.publish = orig_publish
+
+    assert row["tool_args_json"], "raw json string key still present"
+    assert row["tool_result_json"], "raw json string key still present"
+    # PR #49: parsed keys must ride along on the echoed row
+    assert row["tool_args"] == {"question": "Render?", "options": ["Yes", "No"]}
+    assert row["tool_result"]["options"] == ["Yes", "No"]
+    assert row["tool_result"]["scope"] == "render"
