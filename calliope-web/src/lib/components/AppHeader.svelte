@@ -1,6 +1,6 @@
 <script lang="ts">
 	interface Props {
-		active?: 'projects' | 'canvas' | 'settings';
+		active?: 'projects' | 'canvas' | 'build-scene' | 'settings';
 		crumb?: string;
 		/** Optional status content rendered between the crumb and the nav. */
 		status?: import('svelte').Snippet;
@@ -26,6 +26,7 @@
 		<nav class="top-nav" aria-label="Primary">
 			<a class="nav-link" class:active={active === 'canvas'} href="/canvas">AI Canvas</a>
 			<a class="nav-link" class:active={active === 'projects'} href="/projects">Projects</a>
+			<a class="nav-link" class:active={active === 'build-scene'} href="/build-scene">Build Scene</a>
 			<a class="nav-link" class:active={active === 'settings'} href="/settings">Settings</a>
 		</nav>
 	</div>

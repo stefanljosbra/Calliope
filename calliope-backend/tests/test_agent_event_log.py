@@ -361,9 +361,9 @@ def test_prompt_sections_ordered_and_skippable(client):
     # persona(10) < mode(20) < extra(25) < workspace(30) < discipline(40)
     assert text.index("production agent") < text.index("SANDBOX")
     assert text.index("SANDBOX") < text.index("EXTRA-SECTION")
-    assert text.index("EXTRA-SECTION") < text.index("Tool discipline")
+    assert text.index("EXTRA-SECTION") < text.index("ReAct loop")
     assert "Tagged workflows" in text
-    assert text.index("Tagged workflows") < text.index("Tool discipline")
+    assert text.index("Tagged workflows") < text.index("ReAct loop")
 
 
 def test_prompt_sections_tie_order_keeps_registration_order(client):
@@ -397,7 +397,7 @@ def test_prompt_assemble_survives_broken_section(client):
     service.register("broken", 35, broken)
     text = asyncio.run(service.assemble(ToolContext(session_id=1)))
     assert "production agent" in text
-    assert "Tool discipline" in text
+    assert "ReAct loop" in text
     assert "exploded" not in text
 
 
@@ -415,7 +415,7 @@ def test_hardening_section_reflects_settings(client):
         settings.agent_hardening_prompt = "CUSTOM-RULE: stay in scope"
         text = asyncio.run(service.assemble(ctx))
         assert "CUSTOM-RULE: stay in scope" in text
-        assert text.index("Tool discipline") < text.index("CUSTOM-RULE: stay in scope")
+        assert text.index("ReAct loop") < text.index("CUSTOM-RULE: stay in scope")
 
         # Blank disables the hardening block.
         settings.agent_hardening_prompt = "   "
@@ -539,3 +539,114 @@ def test_format_calliope_context_empty():
     )
     assert "workflow_id=1" in two
     assert "workflow_id=2" not in two
+
+
+def test_project_user_content_image_attachment_becomes_image_part(tmp_path, monkeypatch):
+    """User-attached images project as OpenAI image_url parts (visible to
+    vision models); video/audio attachments stay text-only path lines."""
+    import base64
+
+    from calliope.config import settings as cfg
+
+    img = tmp_path / "ref.png"
+    payload = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    )
+    img.write_bytes(payload)
+    monkeypatch.setattr(cfg, "assets_dir", tmp_path)
+
+    content = session_log.project_user_content(
+        "match this pose",
+        attachments=[{"path": str(img), "name": "ref.png", "kind": "image"}],
+    )
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "match this pose" in content[0]["text"]
+    assert "attached:" in content[0]["text"]
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    # Non-image attachments never become parts.
+    text_only = session_log.project_user_content(
+        "hello",
+        attachments=[{"path": str(img), "name": "ref.png", "kind": "video"}],
+    )
+    assert isinstance(text_only, str)
+
+    # A path outside assets_dir degrades to text (no part, no crash).
+    outside = tmp_path.parent / "elsewhere.png"
+    outside.write_bytes(payload)
+    degraded = session_log.project_user_content(
+        "hi",
+        attachments=[{"path": str(outside), "name": "elsewhere.png", "kind": "image"}],
+    )
+    assert isinstance(degraded, str)
+
+
+def test_project_user_content_document_attachment_becomes_script_text(tmp_path, monkeypatch):
+    """.txt/.md/.docx attachments are read and injected between delimiters —
+    the script-upload path. Degradation mirrors image/video handling."""
+    import zipfile
+
+    from calliope.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "assets_dir", tmp_path)
+
+    script = tmp_path / "my-script.txt"
+    script.write_text("INT. ROOFTOP - NIGHT\nMin-Ji stares at the skyline.", encoding="utf-8")
+
+    content = session_log.project_user_content(
+        "make this into a story",
+        attachments=[{"path": str(script), "name": "my-script.txt", "kind": "document"}],
+    )
+    assert isinstance(content, list)
+    text = content[0]["text"]
+    assert "[Script document: my-script.txt]" in text
+    assert "Min-Ji stares at the skyline." in text
+    assert "[/Script document]" in text
+    assert 'script document: "my-script.txt"' in text  # appendix line
+
+    # Markdown reads the same way.
+    md = tmp_path / "notes.md"
+    md.write_text("# Beat one", encoding="utf-8")
+    md_content = session_log.project_user_content(
+        "use this",
+        attachments=[{"path": str(md), "name": "notes.md", "kind": "document"}],
+    )
+    assert isinstance(md_content, list) and "# Beat one" in md_content[0]["text"]
+
+    # docx: minimal word/document.xml inside a zip.
+    docx_path = tmp_path / "script.docx"
+    with zipfile.ZipFile(docx_path, "w") as zf:
+        zf.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?><w:document xmlns:w="w">'
+            "<w:body><w:p><w:r><w:t>Scene one line.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Scene two line.</w:t></w:r></w:p></w:body></w:document>",
+        )
+    docx_content = session_log.project_user_content(
+        "from this doc",
+        attachments=[{"path": str(docx_path), "name": "script.docx", "kind": "document"}],
+    )
+    assert isinstance(docx_content, list)
+    assert "Scene one line." in docx_content[0]["text"]
+    assert "Scene two line." in docx_content[0]["text"]
+
+    # A path outside assets_dir degrades to the plain text branch.
+    outside = tmp_path.parent / "elsewhere.txt"
+    outside.write_text("secret", encoding="utf-8")
+    degraded = session_log.project_user_content(
+        "hi",
+        attachments=[{"path": str(outside), "name": "elsewhere.txt", "kind": "document"}],
+    )
+    assert isinstance(degraded, str)
+
+    # Oversized documents truncate with an explicit note.
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 70_000, encoding="utf-8")
+    big_content = session_log.project_user_content(
+        "hi",
+        attachments=[{"path": str(big), "name": "big.txt", "kind": "document"}],
+    )
+    assert isinstance(big_content, list)
+    assert "[Document truncated:" in big_content[0]["text"]

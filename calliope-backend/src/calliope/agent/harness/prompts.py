@@ -1,14 +1,22 @@
-"""System-prompt assembly from registered sections.
+"""System prompt composition — a section registry, assembled per step.
 
-Ported from the deepseek-harness `ctx.systemPrompt` seam: instead of one
-hardcoded string, plugins contribute ordered sections. `assemble(ctx)` renders
-them (a section may skip itself, e.g. workspace digest in sandbox mode).
+Ported from the deepseek-harness shape: the system prompt is a list of
+registered sections (key, order, render) sorted by order and joined.
+One broken section must never kill the prompt.
+
+The tool-discipline section is deliberately LEAN. This is a local harness
+for a local user: the rules teach the ReAct cycle (look → act → observe →
+decide → finish) and get out of the way. The user's message is the plan;
+permissions flow from it; guards exist to catch mistakes, not to run the
+show. What killed canvas/70 was an agent that got a guard denial and then
+ground in circles for ten minutes — the rules below make escalation and
+finishing first-class moves instead.
 """
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from calliope.agent.harness.registry import ToolContext, _db, _project_stats
 from calliope.config import settings
@@ -24,7 +32,7 @@ class PromptSection:
     key: str
     order: int  # ascending; ties keep registration order
     render: Callable[[ToolContext], Awaitable[str | None]]
-    seq: int = 0  # registration-order tiebreaker
+    seq: int = field(default=0)  # registration-order tiebreaker
 
 
 class SystemPromptService:
@@ -50,7 +58,6 @@ class SystemPromptService:
             try:
                 text = await section.render(ctx)
             except Exception:
-                # One broken section must not kill the whole system prompt.
                 logger.exception("Prompt section %r failed; skipping", section.key)
                 continue
             if text:
@@ -59,7 +66,7 @@ class SystemPromptService:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Built-in sections (port of the previous monolithic prompt)
+# Built-in sections
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -122,9 +129,9 @@ def _mode_text(ctx: ToolContext) -> str:
         "update_scene.order=25. Never treat a # as a database id.\n"
         "- To file a generated image onto a character, environment, or item: "
         "attach_asset with job_id (or path) and a name or entity id.\n"
-        "- Film clips: enqueue_video_jobs with orders or scene_ids for ONLY "
+        "- Film clips: enqueue_video_jobs with refs/clip_ids/orders for ONLY "
         "the clips they named. Never dump every scene_id. Never omit the "
-        "list (that is not 'all'). all_scenes=true only if they said all/"
+        "list (that is not 'all'). all_clips=true only if they said all/"
         "every clip. Orphan video jobs (wired_to_scene=false) use "
         "attach_asset target=scene + scene_id.\n"
         "- Clip versioning ('apply render 430 to scene 2', 'use the older "
@@ -213,64 +220,48 @@ def _render_digest(p, stats, beats, chars, locs, scenes, pending) -> str:
 
 async def _tool_discipline_section(ctx: ToolContext) -> str | None:
     return (
-        "Tool discipline:\n"
-        "1. READ BEFORE WRITE. Before generate_*, update_*, add_*, delete_*, "
-        "reorder_*, or enqueue_*: call get_workspace (or the matching list "
-        "tool) to see current state. Never edit blind.\n"
-        "2. ONE tool call at a time — wait for its result before the next. "
-        "Never fabricate results or guess ids.\n"
-        "3. DESTRUCTIVE TOOLS: generate_story and generate_script with "
-        "replace=true DELETE existing data (beats/characters/locations, or all "
-        "scenes). When the project already has content, the call is BLOCKED "
-        "unless the user's latest message explicitly asks for/confirms the "
-        "replacement. If it is blocked, ask the user; once they answer yes "
-        "(e.g. 'yes, replace'), retry replace=true and it will go through. "
-        "Otherwise pass replace=false to append.\n"
-        "4. RENDERS ARE HUMAN-IN-THE-LOOP. enqueue_asset_jobs, enqueue_video_jobs, "
-        "and run_workflow queue real renders. NEVER call them unless the user's "
-        "latest message explicitly asks for generation (e.g. 'generate the images', "
-        "'render the video', 'create an image') or confirms your offer. "
-        "Text edits — add_item, add_character, add_location, update_scene, "
-        "generate_story, generate_script, etc. — are NOT permission to render. "
-        "After text edits, if images/videos are missing, tell the user and ASK "
-        "whether to generate; wait for their yes — do not call run_workflow in "
-        "the same turn as the question. Render tools are hidden until they ask. "
-        "Also call comfy_server_info first; if ComfyUI is unreachable or dry_run "
-        "is on, say so and stop.\n"
-        "4b. NO COMFY MCP. There is no MCP run_workflow / comfy_run_workflow / "
-        "comfy_run_template / comfy_search_templates. The only comfy_* tool is "
-        "comfy_server_info (health). Calliope run_workflow is the HTTP queue "
-        "(tagged @workflow), not MCP. Use enqueue_asset_jobs / enqueue_video_jobs "
-        "for project assets and clips.\n"
-        "5. ASSETS BEFORE VIDEO: reference-based video needs character sheets "
-        "and location images to exist. After enqueue_asset_jobs, wait_for_jobs "
-        "and only enqueue_video_jobs once images are ready.\n"
-        "5b. SCENE CLIPS ARE WIRED IN CODE. On a linked film, video generate "
-        "must be enqueue_video_jobs (orders=#N or scene_ids) or run_workflow "
-        "with scene_id from list_scenes. The worker writes scenes.video_path "
-        "from job.scene_id. Do not add_scene to 'fix' a missing clip. If "
-        "wait_for_jobs returns wired_to_scene=false, call attach_asset "
-        "target=scene with that job_id and the existing scene_id.\n"
-        "5c. #N IS ORDER. The Video page shows #1, #2… as order_index. "
-        "scene_id is a different, larger database id. list_scenes / "
-        "update_scene / delete_scene / enqueue_video_jobs accept order so "
-        "you can follow the user. Search with list_scenes query= or "
-        "orders=[25,26]. Never enqueue more clips than they named.\n"
-        "6. Standard EDIT pipeline (text only, no renders): create_project → "
-        "generate_story → generate_script → add/update assets (characters, "
-        "locations, items) as needed. Rendering is a SEPARATE step that only "
-        "runs after the user explicitly asks for it.\n"
-        "7. FINISH: when the request is complete, reply with a concise "
-        "plain-text summary (what was created/changed, job ids enqueued, any "
-        "failures) with NO tool call.\n"
-        "8. MEMORY: save_memory records a DURABLE preference or convention "
-        "for future sessions — call it the moment the user states one "
-        "('I always want…', 'never do…', 'prefer terse', 'this project uses "
-        "X style') or corrects you in a way that will recur. One atomic "
-        "sentence. Do NOT save one-off task details or ids. Before saving, "
-        "list_memories; if a memory now contradicts an older one, "
-        "forget_memory the stale one first. Saved memories are injected into "
-        "your system prompt each turn — follow them."
+        "You work in a ReAct loop: each step you may call tools, see their "
+        "results, and decide the next move. Multi-step is normal — one tool "
+        "call per step, observe the result, then reason and act again. The "
+        "user's message is the plan; execute it.\n"
+        "1. ACT on the request. If a tool matches what the user asked, call "
+        "it — don't re-read state you already have, don't ask what has "
+        "already been answered. One get_workspace at the START of a turn is "
+        "plenty; the digest above is usually enough.\n"
+        "2. OBSERVE. Tool results tell you what happened. A result with "
+        "ok:false is information, not a wall: read the error, fix the "
+        "arguments or pick a different tool. NEVER repeat the exact same "
+        "call expecting a different result — after one failed attempt, "
+        "either CHANGE the approach (different args / different tool) or "
+        "hand control back to the user.\n"
+        "3. ESCALATE, don't spin. If you are blocked twice on the same "
+        "goal, or a guard denies you, stop retrying: tell the user exactly "
+        "what was denied and why, then either ask_user (question card) or "
+        "end the turn with a plain explanation. Two failed attempts = "
+        "report, not retry.\n"
+        "4. FINISH cleanly. When the goal is met, reply with a concise "
+        "summary of what was created/changed (ids, job numbers) and NO "
+        "tool call. Ending the turn with an answer is always allowed.\n"
+        "5. GUARDS: destructive tools (generate_story / generate_script "
+        "replace=true) are blocked only when the user did NOT ask for the "
+        "replacement — if they asked (e.g. 'regenerate the script'), the "
+        "guard allows it and you should just retry; if they didn't, "
+        "ask_user first, then retry once they confirm. Renders "
+        "(enqueue_*, run_workflow) need the user to have asked for "
+        "generation in their own words; render tools are hidden until "
+        "then. A guard denial names the reason — act on it once, don't "
+        "loop.\n"
+        "6. SCOPE from args, never from vibes: pass the ids/refs the user "
+        "named (orders=[3], clip_ids=[12], character_ids=[5]); bulk flags "
+        "(all_missing / all_clips) only when they said all/every/"
+        "remaining. Bulk enqueues above 3 targets are refused without "
+        "such a word — that gate is about size, not permission.\n"
+        "7. #N is ORDER (clip number), never a database id. IDs come only "
+        "from tool results. Never fabricate ids or results.\n"
+        "8. MEMORY: save_memory the moment the user states a durable "
+        "preference or corrects a recurring behavior (one atomic "
+        "sentence; list first, forget stale contradictions). Do not save "
+        "one-off task details."
     )
 
 

@@ -16,6 +16,7 @@ import base64
 import json
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from calliope.config import settings
@@ -249,7 +250,11 @@ def format_calliope_context(
         if not path:
             continue
         kind = str(a.get("kind") or "image")
-        att_lines.append(f"attached: {path} ({kind})")
+        if kind == "document":
+            name = str(a.get("name") or "").strip() or Path(path).name
+            att_lines.append(f'script document: "{name}" — the user uploaded their own script; draft from it')
+        else:
+            att_lines.append(f"attached: {path} ({kind})")
     # Guardrail: one Calliope workflow per turn so the model cannot fan out
     # run_workflow across several tagged ids.
     lines = ([wf_lines[0]] if wf_lines else []) + skill_lines + att_lines
@@ -267,8 +272,10 @@ def project_user_content(
 
     Image attachments become OpenAI-style ``image_url`` content parts (data
     URLs read from disk), so vision-capable models see the actual pixels
-    instead of just a path line. Returns a plain string when there are no
-    usable images (the common text-only case).
+    instead of just a path line. Video attachments become evenly-spaced JPEG
+    frames (ffmpeg), each an ``image_url`` part, with a timestamp map in the
+    text part so the model can place motion on a timeline. Returns a plain
+    string when there are no usable attachments (the common text-only case).
     """
     appendix = format_calliope_context(mentions, attachments)
     prose = (content or "").rstrip()
@@ -277,20 +284,43 @@ def project_user_content(
         text = f"{prose}\n\n{appendix}" if prose else appendix
 
     image_parts: list[dict[str, Any]] = []
+    video_lines: list[str] = []
+    document_blocks: list[str] = []
     for a in attachments or []:
         if not isinstance(a, dict):
             continue
-        if str(a.get("kind") or "image") != "image":
-            continue
-        data_url = _image_attachment_data_url(str(a.get("path") or ""))
-        if data_url:
-            image_parts.append(
-                {"type": "image_url", "image_url": {"url": data_url}}
-            )
-    if not image_parts:
+        kind = str(a.get("kind") or "image")
+        path = str(a.get("path") or "")
+        if kind == "image":
+            data_url = _image_attachment_data_url(path)
+            if data_url:
+                image_parts.append(
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                )
+        elif kind == "video":
+            frames = _video_attachment_frames(path)
+            for ts, data_url in frames:
+                image_parts.append(
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                )
+                video_lines.append(f"{path} frame at {ts:.2f}s")
+            if not frames:
+                continue
+        elif kind == "document":
+            doc_text = _document_attachment_text(path, str(a.get("name") or ""))
+            if doc_text:
+                document_blocks.append(doc_text)
+    if not image_parts and not document_blocks:
         return text
 
-    parts: list[dict[str, Any]] = [{"type": "text", "text": text or "(see attached image)"}]
+    frame_map = ""
+    if video_lines:
+        frame_map = "\n\n[Video frames in order]\n" + "\n".join(video_lines)
+    if document_blocks:
+        frame_map = "\n\n" + "\n\n".join(document_blocks) + frame_map
+    parts: list[dict[str, Any]] = [
+        {"type": "text", "text": (text or "(see attached)") + frame_map}
+    ]
     parts.extend(image_parts)
     return parts
 
@@ -314,10 +344,6 @@ def _image_attachment_data_url(path: str) -> str | None:
     path is missing/outside assets_dir, not a known image type, or too large
     after decoding.
     """
-    from pathlib import Path
-
-    from calliope.config import settings
-
     raw = str(path or "").strip()
     if not raw:
         return None
@@ -336,6 +362,177 @@ def _image_attachment_data_url(path: str) -> str | None:
     if not data or len(data) > _MAX_VISION_IMAGE_BYTES:
         return None
     return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+# Video attachments are "seen" as evenly-spaced frames (user choice: frame
+# extraction over native video_url — works on ANY vision endpoint). 8 frames
+# is enough for blockout motion mapping without drowning the context; each
+# frame reuses the image budget.
+_MAX_VIDEO_FRAMES = 8
+_MAX_VIDEO_FRAME_BYTES = 512_000
+_VIDEO_MIME_BY_EXT = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+    ".m4v": "video/x-m4v",
+}
+
+
+def _run_ffmpeg(args: list[str], timeout: float = 30.0) -> bytes | None:
+    """Run a short ffmpeg/ffprobe command; stdout bytes or None."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which(args[0])
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [exe, *args[1:]],
+            capture_output=True,
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _ffprobe_duration_seconds(path: Path) -> float | None:
+    out = _run_ffmpeg(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        timeout=15.0,
+    )
+    if not out:
+        return None
+    try:
+        data = json.loads(out.decode("utf-8", "replace"))
+        duration = float(data["format"]["duration"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
+
+
+def _extract_video_frames(path: Path) -> list[tuple[float, bytes]]:
+    """Evenly-spaced JPEG frames + timestamps (seconds), ≤ _MAX_VIDEO_FRAMES.
+
+    Empty list when ffmpeg is unavailable or extraction fails — the caller
+    degrades to the path-only text line.
+    """
+    import tempfile
+
+    if _run_ffmpeg(["ffmpeg", "-version"], timeout=10.0) is None:
+        return []
+    duration = _ffprobe_duration_seconds(path)
+    if duration is None:
+        return []
+    # timestamped frames via the fps filter: N frames spread across the clip
+    fps_expr = f"fps={_MAX_VIDEO_FRAMES}/{duration:.6f}"
+    frames: list[tuple[float, bytes]] = []
+    with tempfile.TemporaryDirectory(prefix="calliope-vidframes-") as tmp:
+        pattern = str(Path(tmp) / "frame_%02d.jpg")
+        _run_ffmpeg(
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", str(path),
+                "-vf", f"{fps_expr},scale='min(768,iw)':-2",
+                "-frames:v", str(_MAX_VIDEO_FRAMES),
+                "-q:v", "5",
+                pattern,
+            ],
+            timeout=45.0,
+        )
+        files = sorted(Path(tmp).glob("frame_*.jpg"))
+        for i, f in enumerate(files[:_MAX_VIDEO_FRAMES]):
+            data = f.read_bytes()
+            if not data or len(data) > _MAX_VIDEO_FRAME_BYTES:
+                continue
+            # frame k of N evenly spread over duration lands at k*duration/N
+            ts = round(i * duration / max(1, len(files)), 2)
+            frames.append((ts, data))
+    return frames
+
+
+def _video_attachment_frames(path: str) -> list[tuple[float, str]]:
+    """Frame data URLs (+timestamps) for a video attachment under assets_dir.
+
+    Mirrors _image_attachment_data_url's containment rules; returns [] when
+    the path is missing/outside assets_dir, not a known video type, or when
+    ffmpeg/ffprobe is unavailable.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return []
+    try:
+        target = Path(raw).resolve()
+        target.relative_to(settings.assets_dir.resolve())
+    except (ValueError, OSError):
+        return []
+    if target.suffix.lower() not in _VIDEO_MIME_BY_EXT or not target.is_file():
+        return []
+    frames = _extract_video_frames(target)
+    return [
+        (ts, f"data:image/jpeg;base64,{base64.b64encode(data).decode()}")
+        for ts, data in frames
+    ]
+
+
+# Document attachments (.txt/.md/.docx) are read as text and injected into the
+# user turn between delimiters — the whole point is the agent drafting from a
+# user-written script without any separate ingestion path.
+_MAX_DOCUMENT_CHARS = 60_000
+_DOCUMENT_EXTS = {".txt", ".md", ".docx"}
+
+
+def _extract_docx_text(target: Path) -> str:
+    """.docx → text via stdlib zipfile + XML tag-strip (word/document.xml)."""
+    import re as _re
+    import zipfile
+
+    with zipfile.ZipFile(target) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8", errors="replace")
+    # Paragraph and break tags become newlines before stripping.
+    xml = xml.replace("</w:p>", "\n").replace("<w:br/>", "\n").replace("<w:tab/>", "\t")
+    text = _re.sub(r"<[^>]+>", "", xml)
+    return text
+
+
+def _document_attachment_text(path: str, name: str = "") -> str | None:
+    """Read a document attachment under assets_dir as bounded plain text.
+
+    Returns None (the appendix still names the file) when the path is
+    missing/outside assets_dir or not a known document type. Text is truncated
+    at _MAX_DOCUMENT_CHARS with an explicit note so the model knows it saw a
+    partial document.
+    """
+    import zipfile
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    try:
+        target = Path(raw).resolve()
+        target.relative_to(settings.assets_dir.resolve())
+    except (ValueError, OSError):
+        return None
+    if target.suffix.lower() not in _DOCUMENT_EXTS or not target.is_file():
+        return None
+    try:
+        if target.suffix.lower() == ".docx":
+            text = _extract_docx_text(target)
+        else:
+            text = target.read_text(encoding="utf-8", errors="replace")
+    except (OSError, zipfile.BadZipFile):
+        return None
+    label = name or target.name
+    if len(text) > _MAX_DOCUMENT_CHARS:
+        return (
+            text[:_MAX_DOCUMENT_CHARS]
+            + f"\n\n[Document truncated: showing first {_MAX_DOCUMENT_CHARS} of {len(text)} characters]"
+        )
+    return f"[Script document: {label}]\n{text}\n[/Script document]"
 
 
 def _downscale_image(target: Path, mime: str) -> bytes | None:

@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { toStore } from 'svelte/store';
 	import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query';
-	import { assetUrl, jobsApi, projects, type Job, type Scene } from '$lib/api';
+	import { assetUrl, jobsApi, projects, type Job, type Scene, type Clip } from '$lib/api';
 	import { estimateTargetSeconds } from '$lib/durationBudget';
 	import { agentDeepLink } from '$lib/agentTasks';
 	import { toast } from '$lib/toast';
@@ -62,6 +62,7 @@
 
 	const scenes = $derived($scenesQuery.data?.scenes ?? []);
 	const sceneCount = $derived(scenes.length);
+	const totalClips = $derived(scenes.reduce((n, s) => n + (s.clips?.length ?? 0), 0));
 	const totalSec = $derived($scenesQuery.data?.estimated_duration_sec ?? 0);
 	const targetSec = $derived.by(() => {
 		const target = $storyQuery.data?.project?.target_duration;
@@ -69,6 +70,63 @@
 	});
 
 	const busy = $derived(adding || deletingId != null);
+
+	// ── Break into shots (coverage expansion) ────────────────────────────
+	let expandingIds = $state<number[]>([]);
+	let expandingAll = $state(false);
+	let expandedIds = $state<number[]>([]);
+
+	function isExpanded(scene: Scene): boolean {
+		return (scene.clips?.length ?? 0) > 1 || expandedIds.includes(scene.id);
+	}
+
+	async function breakIntoShots(scene: Scene) {
+		if (expandingIds.length > 0 || expandingAll) return;
+		expandingIds = [...expandingIds, scene.id];
+		try {
+			const res = await projects.expandClips(projectId, { scene_ids: [scene.id] });
+			expandedIds = [...new Set([...expandedIds, scene.id])];
+			await client.invalidateQueries({ queryKey: ['scenes'] });
+			toast.success(
+				`Scene #${scene.order_index} → ${res.scenes?.[0]?.clip_count ?? '?'} shots`,
+			);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : 'Could not break scene into shots');
+		} finally {
+			expandingIds = expandingIds.filter((id) => id !== scene.id);
+		}
+	}
+
+	async function breakAllIntoShots() {
+		if (expandingIds.length > 0 || expandingAll) return;
+		if (
+			!window.confirm(
+				`Break ALL ${sceneCount} scenes into shot clips? Existing shots of those scenes are replaced.`,
+			)
+		)
+			return;
+		expandingAll = true;
+		try {
+			const res = await projects.expandClips(projectId, { all: true });
+			expandedIds = scenes.map((s) => s.id);
+			await client.invalidateQueries({ queryKey: ['scenes'] });
+			toast.success(`Board expanded to ${res.total_clips} clips`);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : 'Could not break scenes into shots');
+		} finally {
+			expandingAll = false;
+		}
+	}
+
+	async function deleteClip(clip: Clip, scene: Scene) {
+		try {
+			await projects.deleteClip(projectId, clip.id);
+			await client.invalidateQueries({ queryKey: ['scenes'] });
+			toast.success(`Deleted shot #${scene.order_index}.${clip.order_index}`);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : 'Could not delete clip');
+		}
+	}
 
 	const saveMutation = createMutation({
 		mutationFn: () =>
@@ -109,6 +167,14 @@
 	function jobForScene(sceneId: number): Job | undefined {
 		const jobs = ($jobsQuery.data ?? []).filter(
 			(j) => j.scene_id === sceneId && j.kind === 'video',
+		);
+		if (jobs.length === 0) return undefined;
+		return [...jobs].sort((a, b) => b.id - a.id)[0];
+	}
+
+	function jobForClip(clipId: number): Job | undefined {
+		const jobs = ($jobsQuery.data ?? []).filter(
+			(j) => (j as Job & { clip_id?: number | null }).clip_id === clipId && j.kind === 'video',
 		);
 		if (jobs.length === 0) return undefined;
 		return [...jobs].sort((a, b) => b.id - a.id)[0];
@@ -262,12 +328,24 @@
 			{/if}
 			{#if sceneCount > 0}
 				· {sceneCount} scenes
+				{#if totalClips > 0}
+					/ {totalClips} shot clips
+				{/if}
 			{/if}
 		</p>
 	</div>
 	<div class="stage-actions">
 		<Button variant="secondary" disabled={busy} loading={adding} onclick={addScene}>
 			<Icon name="plus" size={14} /> Add Scene
+		</Button>
+		<Button
+			variant="secondary"
+			disabled={busy || expandingAll || expandingIds.length > 0 || sceneCount === 0}
+			loading={expandingAll}
+			onclick={breakAllIntoShots}
+			title="Break every scene into shot clips (LLM coverage pass)"
+		>
+			<Icon name="film" size={14} /> Break All Into Shots
 		</Button>
 		<Button variant="primary" disabled={busy} onclick={requestRegenerate}>
 			<Icon name="sparkle" size={15} /> Regenerate Script
@@ -355,6 +433,61 @@
 				{#if scene.dialog}
 					<pre class="dialog">{scene.dialog}</pre>
 				{/if}
+				<div class="clip-block">
+					<div class="clip-head">
+						<span class="clip-title">
+							<Icon name="film" size={12} />
+							{(scene.clips ?? []).length}
+							{(scene.clips ?? []).length === 1 ? 'shot clip' : 'shot clips'}
+							{#if (scene.clips ?? []).some((c) => c.clip_path)}
+								· {(scene.clips ?? []).filter((c) => c.clip_path).length} rendered
+							{/if}
+						</span>
+						<Button
+							variant="secondary"
+							size="sm"
+							disabled={busy || expandingIds.length > 0 || expandingAll}
+							loading={expandingIds.includes(scene.id)}
+							onclick={() => breakIntoShots(scene)}
+							title={isExpanded(scene) ? 'Re-break this scene into shots (replaces existing shots)' : 'Break this scene into multiple shot clips via the coverage pass'}
+						>
+							{isExpanded(scene) ? 'Re-break Into Shots' : 'Break Into Shots'}
+						</Button>
+					</div>
+					{#if isExpanded(scene) && (scene.clips ?? []).length > 1}
+						<ul class="clip-list">
+							{#each scene.clips ?? [] as clip (clip.id)}
+								{@const clipJob = jobForClip(clip.id)}
+								<li class="clip-row">
+									<span class="clip-num" class:ready={Boolean(clip.clip_path)}>
+										#{scene.order_index}.{clip.order_index}
+									</span>
+									<span class="clip-desc">{clip.description || 'Untitled shot'}</span>
+									{#if clip.shot_size}
+										<span class="chip">{clip.shot_size}</span>
+									{/if}
+									{#if clipJob && (clipJob.status === 'pending' || clipJob.status === 'running')}
+										<span class="chip chip-render">rendering…</span>
+									{:else if clip.clip_path}
+										<span class="chip chip-ok">✓ clip</span>
+									{/if}
+									{#if clip.duration_sec}
+										<span class="clip-dur">{clip.duration_sec}s</span>
+									{/if}
+									<button
+										type="button"
+										class="icon-btn"
+										aria-label="Delete shot #{scene.order_index}.{clip.order_index}"
+										title="Delete this shot"
+										onclick={() => deleteClip(clip, scene)}
+									>
+										<Icon name="trash" size={13} />
+									</button>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				</div>
 				<div class="chips">
 					{#each scene.characters ?? [] as c (c.id)}
 						{@const avatar = avatarFor(c)}
@@ -634,6 +767,72 @@
 		color: var(--accent);
 		border-color: var(--accent);
 		background: color-mix(in srgb, var(--accent) 12%, var(--bg-elevated));
+	}
+	.clip-block {
+		margin-top: 10px;
+		border-top: 1px dashed var(--border);
+		padding-top: 8px;
+	}
+	.clip-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 8px;
+	}
+	.clip-title {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--text-secondary);
+	}
+	.clip-list {
+		list-style: none;
+		margin: 8px 0 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.clip-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		background: var(--bg-elevated);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		padding: 4px 8px;
+		font-size: 12px;
+	}
+	.clip-num {
+		font-family: var(--font-mono);
+		font-weight: 700;
+		color: var(--text-secondary);
+		flex-shrink: 0;
+	}
+	.clip-num.ready {
+		color: var(--accent);
+	}
+	.clip-desc {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--text-primary);
+	}
+	.clip-dur {
+		color: var(--text-muted);
+		flex-shrink: 0;
+	}
+	.chip-ok {
+		color: var(--accent);
+		border-color: var(--accent);
+	}
+	.chip-render {
+		color: var(--warning, #eab308);
+		border-color: var(--warning, #eab308);
 	}
 	.avatar {
 		position: relative;

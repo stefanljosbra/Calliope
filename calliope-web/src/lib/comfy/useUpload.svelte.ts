@@ -93,5 +93,6 @@ export function truncateMiddle(name: string, max = 32): string {
 export function acceptForKind(kind: string): string {
 	if (kind === 'audio') return 'audio/*';
 	if (kind === 'video') return 'video/*,.mp4,.webm,.mov,.mkv';
+	if (kind === 'document') return '.txt,.md,.docx';
 	return 'image/*';
 }
