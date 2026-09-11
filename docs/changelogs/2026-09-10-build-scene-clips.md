@@ -11,10 +11,8 @@ text prompt and hoping, you block the shot out in 3D first — pose figures,
 place blocks, keyframe motion, frame the camera — then feed the rendered
 result into your project as a reference image/video.
 
-Svelte-native port of
-[open-media](https://github.com/Anujatk1999/open-media)'s Shot Composer
-(MIT): framework-agnostic logic ported nearly verbatim, UI rebuilt as
-Svelte 5 components over plain three.js.
+<img width="1781" height="1248" alt="Screenshot 2026-09-11 060020" src="https://github.com/user-attachments/assets/f8b39354-de28-4e6b-a055-b91c6ee33a4a" />
+
 
 - **New "Build Scene" tab** with the same three-panel shell as AI Canvas:
   scene tree + inspector (left), 3D viewport (center), agent chat (right).
