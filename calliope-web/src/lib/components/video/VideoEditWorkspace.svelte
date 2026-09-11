@@ -4,7 +4,7 @@
 	 * Hero monitor + filmstrip + meta strip + docked Omni composer.
 	 * Does not reuse the old top two-card clip-stage layout.
 	 */
-	import type { Job, Scene, Workflow } from '$lib/api';
+	import type { Clip, Job, Scene, Workflow } from '$lib/api';
 	import OmniComposer from '$lib/components/OmniComposer.svelte';
 	import type { AssetOption } from '$lib/assetPicker';
 	import Icon from '$lib/components/ui/Icon.svelte';
@@ -12,7 +12,7 @@
 	import ClipSourceModal from './ClipSourceModal.svelte';
 	import JobInputsDrawer from './JobInputsDrawer.svelte';
 	import PromptPreviewModal from './PromptPreviewModal.svelte';
-	import SceneFilmstrip from './SceneFilmstrip.svelte';
+	import SceneFilmstrip, { type FilmstripClip } from './SceneFilmstrip.svelte';
 	import SceneScriptDrawer from './SceneScriptDrawer.svelte';
 
 	type Thumb = { kind: 'image' | 'video'; src: string } | null;
@@ -39,26 +39,30 @@
 
 	interface Props {
 		scenes: Scene[];
+		/** Flattened clips in playback order — the filmstrip + selection units. */
+		filmClips: FilmstripClip[];
+		/** Selected clip (defaults to the scene's first when the scene has one clip). */
+		selectedClip: { clip: Clip; scene: Scene; index: number; label: string } | null;
+		selectedClipId: number | null;
 		selected: Scene;
-		selectedId: number | null;
 		status: string;
 		previewPath: string | null;
 		progress?: Progress | null;
 		error?: string;
 		errorLong?: boolean;
-	/** Latest video job for the scene — drives the "what was sent" drawer. */
+	/** Latest video job for the selected clip — drives the "what was sent" drawer. */
 	job?: Job | null;
-	/** All video jobs for the scene (history strip in the drawer). */
-	sceneJobs?: Job[];
+	/** All video jobs for the selected clip (history strip in the drawer). */
+	clipJobs?: Job[];
 		workflow: Workflow | undefined;
 		workflows: Workflow[];
 		formValues: Record<string, string | number>;
 		assetOptions: AssetOption[];
 		allowUpload?: boolean;
-		/** Disable Generate: scene continues from the previous video but the workflow cannot accept it. */
+		/** Disable Generate: clip continues from the previous video but the workflow cannot accept it. */
 		generateDisabled?: boolean;
 		generateDisabledReason?: string;
-	/** Where this continue scene's video input comes from (auto / upload / a timeline clip). */
+	/** Where this continue clip's video input comes from (auto / upload / a timeline clip). */
 	clipSource?: ClipSourceConfig;
 	onClipSourceChange?: (value: string) => void;
 	/** Upload file picked in the source modal — caller opens the file dialog. */
@@ -66,32 +70,33 @@
 	/** HITL prompt review before Generate: caller resolves + shows the modal. */
 	onPreviewPrompt?: () => void;
 	generateLabel?: string;
-		chained?: (scene: Scene) => boolean;
 		submitting?: boolean;
-		statusOf: (scene: Scene) => string;
-		thumbFor: (scene: Scene) => Thumb;
+		statusOfClip: (clipId: number) => string;
+		thumbForClip: (clipId: number) => Thumb;
 		formatClock: (sec: number) => string;
-		onSelect: (id: number) => void;
+		onSelectClip: (clipId: number) => void;
 		onStep: (dir: -1 | 1) => void;
 	onWorkflowChange: (id: number) => void;
 	onFormChange?: (values: Record<string, string | number>) => void;
 	onGenerate: () => void;
-	/** Render-history versioning: apply an older job's output to the scene. */
-	onApplyToScene?: (job: Job, path: string) => void;
+	/** Render-history versioning: apply an older job's output to the clip. */
+	onApplyToClip?: (job: Job, path: string) => void;
 	applying?: boolean;
 	}
 
 	let {
 		scenes,
+		filmClips,
+		selectedClip,
+		selectedClipId,
 		selected,
-		selectedId,
 		status,
 		previewPath,
 		progress = null,
 		error = '',
 		errorLong = false,
 		job = null,
-		sceneJobs = [],
+		clipJobs = [],
 		workflow,
 		workflows,
 		formValues = $bindable(),
@@ -104,17 +109,16 @@
 		onClipSourceUpload,
 		onPreviewPrompt,
 		generateLabel = 'Generate clip',
-		chained = () => false,
 		submitting = false,
-		statusOf,
-		thumbFor,
+		statusOfClip,
+		thumbForClip,
 		formatClock,
-		onSelect,
+		onSelectClip,
 		onStep,
 		onWorkflowChange,
 		onFormChange,
 		onGenerate,
-		onApplyToScene,
+		onApplyToClip,
 		applying = false,
 	}: Props = $props();
 
@@ -144,9 +148,11 @@
 		<ClipMonitor
 			{previewPath}
 			{status}
-			heading={selected.heading || 'Untitled'}
+			heading={(selectedClip?.clip.description || selected.heading || 'Untitled').slice(0, 80)}
 			orderIndex={selected.order_index}
-			sceneId={selected.id}
+			label={selectedClip?.label}
+			idLabel={selectedClip ? `clip ${selectedClip.clip.id}` : selected ? `scene id ${selected.id}` : undefined}
+			sceneId={selectedClip?.scene.id ?? selected?.id}
 			{progress}
 			{error}
 			{errorLong}
@@ -154,13 +160,12 @@
 	</div>
 
 	<SceneFilmstrip
-		{scenes}
-		{selectedId}
-		{statusOf}
-		{thumbFor}
+		clips={filmClips}
+		{selectedClipId}
+		{statusOfClip}
+		{thumbForClip}
 		{formatClock}
-		{chained}
-		{onSelect}
+		{onSelectClip}
 		{onStep}
 	/>
 
@@ -225,14 +230,14 @@
 			<JobInputsDrawer
 				bind:open={inputsOpen}
 				{job}
-				jobs={sceneJobs}
+				jobs={clipJobs}
 				{workflow}
-				sceneVideoPath={selected.video_path}
+				sceneVideoPath={selectedClip?.clip.clip_path ?? selected.video_path}
 				onCopySettings={(values) => {
 					formValues = { ...formValues, ...values };
 					onFormChange?.({ ...formValues });
 				}}
-				onApplyToScene={(j, path) => onApplyToScene?.(j, path)}
+				onApplyToScene={(j, path) => onApplyToClip?.(j, path)}
 				applying={applying}
 			/>
 		{/if}

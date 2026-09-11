@@ -2,6 +2,7 @@
 
 Dated notes for GitHub releases. Newest first.
 
+- [2026-09-10 Build Scene + scene → clips](./2026-09-10-build-scene-clips.md) — 3D blockout composer; vision/doc input; 1 scene : N shot clips; faithful scripts (1.5.0)
 - [2026-09-07 chunking + cards](./2026-09-07-chunking-cards.md) — Story/script generate in chunks; ask_user cards appear (1.4.1)
 - [2026-09-06 canvas merge](./2026-09-06-canvas-merge.md) — AI Canvas merges Agents + Playground; skills, memory, question cards (1.4.0)
 - [2026-08-31 hardening](./2026-08-31-hardening.md) — Prompt preview fails fast + never blocks Generate (1.3.2)

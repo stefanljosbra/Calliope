@@ -15,27 +15,33 @@
 		message?: string;
 	}
 
-	interface Props {
-		previewPath: string | null;
-		status: string;
-		heading: string;
-		orderIndex: number;
-		sceneId?: number;
-		progress?: Progress | null;
-		error?: string;
-		errorLong?: boolean;
-	}
+interface Props {
+	previewPath: string | null;
+	status: string;
+	heading: string;
+	orderIndex: number;
+	/** Display label, e.g. '#3.2' — shown on the slate + id strip instead of the plain index. */
+	label?: string;
+	/** Secondary id line, e.g. 'clip 512'. */
+	idLabel?: string;
+	sceneId?: number;
+	progress?: Progress | null;
+	error?: string;
+	errorLong?: boolean;
+}
 
-	let {
-		previewPath,
-		status,
-		heading,
-		orderIndex,
-		sceneId,
-		progress = null,
-		error = '',
-		errorLong = false,
-	}: Props = $props();
+let {
+	previewPath,
+	status,
+	heading,
+	orderIndex,
+	label,
+	idLabel,
+	sceneId,
+	progress = null,
+	error = '',
+	errorLong = false,
+}: Props = $props();
 
 	let errorOpen = $state(false);
 	// '#t=0.1' media fragment: with preload="metadata" browsers paint NOTHING
@@ -56,8 +62,10 @@
 			<SafeMedia class="media" src={previewUrl} kind="video" label="Video unavailable" />
 		{:else}
 			<div class="empty">
-				<span class="slate">#{orderIndex}</span>
-				{#if sceneId != null}
+				<span class="slate">{label ?? `#${orderIndex}`}</span>
+				{#if idLabel}
+					<p class="sid">{idLabel}</p>
+				{:else if sceneId != null}
 					<p class="sid">scene_id {sceneId}</p>
 				{/if}
 				<p class="title">{heading || 'Untitled'}</p>
@@ -93,8 +101,10 @@
 	</div>
 
 	<div class="ids">
-		<span>#{orderIndex}</span>
-		{#if sceneId != null}
+		<span>{label ?? `#${orderIndex}`}</span>
+		{#if idLabel}
+			<span class="ids-db">{idLabel}</span>
+		{:else if sceneId != null}
 			<span class="ids-db">id {sceneId}</span>
 		{/if}
 	</div>

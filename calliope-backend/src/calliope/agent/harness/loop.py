@@ -99,10 +99,17 @@ async def run_turn(
     repeat_cache: dict[str, dict[str, Any]] = {}
     repeat_counts: dict[str, int] = {}
     REPEAT_EXECUTE_LIMIT = 2
+    # Failure thrash guard (canvas/70): an agent that keeps getting errors
+    # (guard denials, bad args) must CHANGE COURSE, not grind. After this
+    # many not-ok results in a row, a directive is injected that forces a
+    # different action or an explicit hand-back to the user.
+    FAIL_STREAK_LIMIT = 2
+    fail_streak = 0
 
     client = _llm_for_role("main")
     final_text = ""
     turn_status = "completed"
+    synthetic_idx: list[int] = []  # positions of budget-nudge messages (stripped after)
     try:
         messages = [m for m in history if m.get("role") != "system"]
         for iteration in range(1, max_iterations + 1):
@@ -111,6 +118,27 @@ async def run_turn(
             # Rebuilt per step: linking mid-run flips tool visibility and the
             # workspace digest changes after each tool.
             system = await prompts.assemble(ctx)
+            remaining = max_iterations - iteration
+            if remaining == 0:
+                # Budget nudge: the FINAL step is dedicated to wrapping up
+                # (answer or report), not starting work it cannot finish —
+                # a turn that dies at the cap with no summary reads as
+                # "agent did nothing".
+                synthetic_idx.append(len(messages))
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] This is your FINAL step of this turn. "
+                            "Do not start new tool work. Either (a) if the "
+                            "goal is already met, reply with a concise "
+                            "summary, or (b) reply with exactly what is "
+                            "blocked and why, and what you need to proceed. "
+                            "The user can continue the task in their next "
+                            "message."
+                        ),
+                    }
+                )
             tools = registry.openai_payload(ctx)
             stream = client.chat_stream(
                 [{"role": "system", "content": system}] + messages,
@@ -297,6 +325,23 @@ async def run_turn(
                 result_text = json.dumps(result, ensure_ascii=False, default=str)
                 if len(result_text) > session_log.TOOL_RESULT_TRUNCATE:
                     result_text = result_text[: session_log.TOOL_RESULT_TRUNCATE] + session_log.TRUNCATE_NOTE
+                # Thrash killer: a run of failures (guard denials, errors)
+                # escalates — the appended directive forces a DIFFERENT
+                # action or an explicit hand-back. Never a third blind try.
+                if isinstance(result, dict) and result.get("ok") is False:
+                    fail_streak += 1
+                elif isinstance(result, dict):
+                    fail_streak = 0
+                if fail_streak >= FAIL_STREAK_LIMIT:
+                    result_text += (
+                        "\n\n[SYSTEM DIRECTIVE] That is "
+                        f"{fail_streak} failed calls in a row on this goal. "
+                        "STOP retrying the same tool. Now either (a) call a "
+                        "DIFFERENT tool with corrected arguments, or (b) end "
+                        "your turn with a clear plain-text report of what is "
+                        "blocked and why, and what you need from the user. "
+                        "Do not call any tool again with the same arguments."
+                    )
                 messages.append(
                     {
                         "role": "tool",
@@ -351,7 +396,12 @@ async def run_turn(
     finally:
         await client.close()
         log_append(session_log.TURN_END, {"turn": turn_no, "status": turn_status})
-        # Persist the exchange into history (the runner saves it to the DB).
+        # Persist the exchange into history (the runner saves it to the DB),
+        # minus the synthetic budget-nudge message — it belongs to THIS
+        # turn's context only and would pollute the next turn.
+        for idx in reversed(synthetic_idx):
+            if 0 <= idx < len(messages) and messages[idx].get("content", "").startswith("[SYSTEM]"):
+                del messages[idx]
         history.clear()
         history.extend(messages)
     return final_text

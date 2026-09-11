@@ -180,6 +180,34 @@ class AgentRunner:
         task = self._tasks.get(session_id)
         return task is not None and not task.done()
 
+    def recover_orphaned_sessions(self) -> int:
+        """Reset sessions stuck in ``running`` at startup.
+
+        A crashed or killed process never reaches the loop's ``turn/end``
+        (its finally-block died with it), so those rows stay ``running``
+        forever — the UI shows a phantom "Working…" state with a dead Stop
+        button and the session looks unresumable. At startup no tasks exist
+        yet, so every ``running`` row is orphaned by definition. Returns the
+        number of rows reset."""
+        conn = self._db()
+        try:
+            stuck = [r["id"] for r in conn.execute(
+                "SELECT id FROM agent_sessions WHERE status = 'running'"
+            ).fetchall()]
+            if stuck:
+                conn.execute(
+                    "UPDATE agent_sessions SET status = 'idle' WHERE status = 'running'"
+                )
+                conn.commit()
+                logger.warning(
+                    "Startup recovery: reset %d agent session(s) left 'running' "
+                    "by a previous process: %s",
+                    len(stuck), stuck,
+                )
+            return len(stuck)
+        finally:
+            conn.close()
+
     async def start_turn(
         self,
         session_id: int,
@@ -277,13 +305,14 @@ class AgentRunner:
         conn = self._db()
         try:
             row = conn.execute(
-                "SELECT project_id FROM agent_sessions WHERE id = ?", (session_id,)
+                "SELECT project_id, origin FROM agent_sessions WHERE id = ?", (session_id,)
             ).fetchone()
             project_id = row["project_id"] if row else None
+            origin = (row["origin"] if row else None) or "chat"
         finally:
             conn.close()
 
-        ctx = ToolContext(session_id=session_id, project_id=project_id)
+        ctx = ToolContext(session_id=session_id, project_id=project_id, origin=origin)
         try:
             final = await orchestrate(
                 ctx,

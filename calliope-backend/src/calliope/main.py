@@ -102,6 +102,9 @@ async def lifespan(app: FastAPI):
             )
     finally:
         conn.close()
+    from calliope.agent.harness.runner import runner
+
+    runner.recover_orphaned_sessions()
     await queue_worker.start()
     logger.info("Calliope started — db=%s dry_run=%s", settings.db_path, settings.dry_run)
     yield

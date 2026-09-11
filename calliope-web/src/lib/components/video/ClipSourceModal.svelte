@@ -10,7 +10,7 @@
 	import Modal from '$lib/components/ui/Modal.svelte';
 
 	interface ClipSourceOption {
-		/** Scene id as string, or the 'auto' / 'upload' sentinels. */
+		/** Source key — a clip/scene path, or the 'auto' / 'upload' sentinels. */
 		id: string;
 		label: string;
 		/** Clip path — renders a video thumbnail when present. */

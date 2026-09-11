@@ -202,6 +202,15 @@ async def orchestrate(
     if len(summary) > 3000:
         summary = summary[:3000] + "…[truncated]"
 
+    if ctx.project_id is None:
+        # Blind/sandbox session (Build Scene, sandbox canvas): every swarm
+        # role's tool subset is project-scoped, so the planner can only
+        # misroute here. Skip it entirely — straight to the single loop —
+        # which also drops the misleading "scheduling a sub-agent" note.
+        history.clear()
+        history.extend(derived)
+        return await run_turn(ctx, history, on_message=on_message)
+
     plan = await _plan(goal, summary)
     if plan.get("mode") == "swarm" and ctx.project_id is None:
         # Swarm sub-agents need project-scoped tools; in a sandbox the single

@@ -1,4 +1,4 @@
-﻿<script lang="ts">
+<script lang="ts">
 	import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query';
 	import { toStore } from 'svelte/store';
 	import { toast } from '$lib/toast';
@@ -8,6 +8,7 @@
 		playgroundApi,
 		projects,
 		workflows,
+		type Clip,
 		type Job,
 		type Scene,
 		type Workflow,
@@ -17,6 +18,7 @@
 	import { normalizeInputRole } from '$lib/comfy/parser';
 	import type { ComfyDynamicInput } from '$lib/comfy/types';
 	import type { AssetOption } from '$lib/assetPicker';
+	import { shotApi } from '$lib/shot/api';
 	import { progressFor } from '$lib/jobProgress';
 	import SafeMedia from './SafeMedia.svelte';
 	import PromptPreviewModal from './video/PromptPreviewModal.svelte';
@@ -36,7 +38,8 @@
 	const client = useQueryClient();
 
 	let view = $state<'edit' | 'film'>('edit');
-	let selectedId = $state<number | null>(null);
+	/** Selected render unit = a clip id (flattened playback order). */
+	let selectedClipId = $state<number | null>(null);
 	let formValues = $state<Record<string, string | number>>({});
 	let selectedWorkflow = $state<Record<number, number>>({});
 	let lastFormScene = $state<number | null>(null);
@@ -93,10 +96,35 @@
 		queryKey: ['playground-uploads'],
 		queryFn: playgroundApi.listUploads,
 	});
+	const shotCapturesQuery = createQuery({
+		queryKey: ['shot-captures-all'],
+		queryFn: async () => {
+			const comps = await shotApi.listCompositions();
+			const pages = await Promise.all(comps.map((c) => shotApi.listCaptures(c.id)));
+			return pages.flatMap((caps, i) =>
+				caps.map((cap) => ({ ...cap, compTitle: comps[i].title })),
+			);
+		},
+	});
 
 	const scenes = $derived(($scenesQuery.data?.scenes ?? []) as Scene[]);
+	/** Flattened clips in playback order — the renderable units. */
+	const allClips = $derived(
+		scenes.flatMap((s) => (s.clips ?? []).map((c) => ({ clip: c, scene: s }))),
+	);
 	const totalSec = $derived(
-		scenes.reduce((sum, s) => sum + Math.max(s.duration_sec || 5, 1), 0),
+		allClips.length > 0
+			? allClips.reduce((sum, { clip }) => sum + Math.max(clip.duration_sec || 5, 1), 0)
+			: scenes.reduce((sum, s) => sum + Math.max(s.duration_sec || 5, 1), 0),
+	);
+
+	/** Flattened filmstrip entries with per-scene shot index + `#3.2` label. */
+	const filmClips = $derived(
+		allClips.map(({ clip, scene }) => {
+			const idx = (scene.clips ?? []).findIndex((c) => c.id === clip.id);
+			const index = idx < 0 ? 0 : idx;
+			return { clip, scene, index, label: clipLabel(scene, index) };
+		}),
 	);
 
 	const assetOptions = $derived.by(() => {
@@ -145,7 +173,28 @@
 			}
 		}
 		for (const up of $uploadsQuery.data ?? []) {
+			// Documents are agent-context files, not Comfy job inputs — never
+			// offer them in a reference picker.
+			if (up.kind === 'document') continue;
 			opts.push({ label: `${up.name} · upload`, path: up.path, kind: up.kind, group: 'upload' });
+		}
+		for (const cap of $shotCapturesQuery.data ?? []) {
+			if (!cap.file_path) continue;
+			if (cap.kind === 'video') {
+				opts.push({
+					label: `${cap.compTitle} · ${cap.label || 'Blockout'} · blockout clip`,
+					path: cap.file_path,
+					kind: 'video',
+					group: 'shot',
+				});
+			} else if (cap.kind === 'image') {
+				opts.push({
+					label: `${cap.compTitle} · ${cap.label || 'Blockout'} · blockout`,
+					path: cap.file_path,
+					kind: 'image',
+					group: 'shot',
+				});
+			}
 		}
 		return opts;
 	});
@@ -160,29 +209,41 @@
 	);
 
 	$effect(() => {
-		if (selectedId != null) return;
-		if (scenes.length > 0) selectedId = scenes[0].id;
+		if (selectedClipId != null && allClips.some((c) => c.clip.id === selectedClipId)) return;
+		selectedClipId = allClips[0]?.clip.id ?? null;
 	});
 
-	const selected = $derived(scenes.find((s) => s.id === selectedId) ?? null);
+	/** The flattened filmstrip entry (clip + scene + label) for the current selection. */
+	const selectedEntry = $derived(
+		filmClips.find((c) => c.clip.id === selectedClipId) ?? null,
+	);
+	const selected = $derived(selectedEntry?.scene ?? null);
 
 	$effect(() => {
-		const id = selected?.id ?? null;
+		const id = selectedClipId ?? null;
 		if (id === lastFormScene) return;
 		if (lastFormScene != null) formCache.set(lastFormScene, formValues);
 		lastFormScene = id;
 		if (id != null) {
+			const entry = filmClips.find((c) => c.clip.id === id);
+			if (!entry) return;
 			const stored = formCache.get(id);
 			if (stored) {
 				formValues = { ...stored };
-			} else if (selected?.video_settings?.input_values) {
-				// First open of a persisted setup: hydrate from the scene row.
+			} else if (entry.clip.video_settings?.input_values) {
+				// First open of a persisted clip setup: hydrate from the clip row.
 				formValues = {
-					...seedSceneDefaults(selected),
-					...selected.video_settings.input_values,
+					...seedClipDefaults(entry),
+					...entry.clip.video_settings.input_values,
+				};
+			} else if (entry.scene.video_settings?.input_values) {
+				// Legacy un-expanded clip: scene row carries the setup.
+				formValues = {
+					...seedClipDefaults(entry),
+					...entry.scene.video_settings.input_values,
 				};
 			} else {
-				formValues = { ...seedSceneDefaults(selected) };
+				formValues = { ...seedClipDefaults(entry) };
 			}
 		} else {
 			formValues = {};
@@ -196,17 +257,17 @@
 	let saveTimer: ReturnType<typeof setTimeout> | null = null;
 	let lastSavedHash = $state('');
 
-	function currentVideoSettings(): Record<string, unknown> {
-		if (!selected) return {};
+	function currentClipSettings(): Record<string, unknown> {
+		if (!selectedEntry) return {};
 		const out: Record<string, unknown> = {
 			input_values: compactInputValues(formValues),
 		};
-		const wfId = selectedWorkflow[selected.id];
+		const wfId = selectedWorkflow[selectedEntry.scene.id];
 		if (wfId) out.form_workflow_id = wfId;
-		const src = clipSource[selected.id];
+		const src = clipSource[selectedEntry.scene.id];
 		if (src) out.clip_source = src;
-		const draft = selected.video_settings?.prompt_draft;
-		const meta = selected.video_settings?.prompt_draft_meta;
+		const draft = selectedEntry.clip.video_settings?.prompt_draft;
+		const meta = selectedEntry.clip.video_settings?.prompt_draft_meta;
 		if (draft) {
 			out.prompt_draft = draft;
 			if (meta) out.prompt_draft_meta = meta;
@@ -220,18 +281,18 @@
 
 	$effect(() => {
 		// Track the pieces that make up the persisted settings.
-		const _unused = [formValues, selectedWorkflow, clipSource, selected?.id];
+		const _unused = [formValues, selectedWorkflow, clipSource, selectedEntry?.clip.id];
 		void _unused;
-		if (!selected || saveTimer) return;
+		if (!selectedEntry || saveTimer) return;
 		saveTimer = setTimeout(() => {
 			saveTimer = null;
-			if (!selected) return;
-			const next = currentVideoSettings();
+			if (!selectedEntry) return;
+			const next = currentClipSettings();
 			const hash = settingsHash(next);
 			if (hash === lastSavedHash) return;
 			lastSavedHash = hash;
 			projects
-				.updateScene(projectId, selected.id, { video_settings: next })
+				.updateClip(projectId, selectedEntry.clip.id, { video_settings: next })
 				.catch(() => {
 					/* transient — next change retries */
 				});
@@ -243,17 +304,18 @@
 		// handles persistence. Kept as an explicit hook for future callers.
 	}
 
-	// Context-aware defaults for a freshly opened scene form (user edits and the
+	// Context-aware defaults for a freshly opened clip form (user edits and the
 	// workflow's static defaults must not override these). Duration-role inputs
-	// seed from the scene's estimated duration; ComfyDynamicForm's own prefill
-	// only applies to fields still undefined afterwards.
-	function seedSceneDefaults(scene: Scene | null): Record<string, string | number> {
+	// seed from the clip's duration (falling back to the scene's estimate);
+	// ComfyDynamicForm's own prefill only applies to fields still undefined.
+	function seedClipDefaults(entry: { clip: Clip; scene: Scene }): Record<string, string | number> {
 		const seed: Record<string, string | number> = {};
-		if (!scene) return seed;
-		const wf = workflowFor(scene);
+		if (!entry) return seed;
+		const wf = workflowFor(entry.scene);
+		const secs = entry.clip.duration_sec ?? entry.scene.duration_sec;
 		for (const inp of wf?.input_schema ?? []) {
-			if (inp.role === 'duration' && scene.duration_sec != null) {
-				seed[inp.nodeId] = scene.duration_sec;
+			if (normalizeInputRole(inp.role ?? null) === 'duration' && secs != null) {
+				seed[inp.nodeId] = secs;
 			}
 		}
 		return seed;
@@ -269,25 +331,39 @@
 		return wf?.input_schema?.find((inp) => normalizeInputRole(inp.role ?? null) === 'video');
 	}
 
-	// Timeline source options for a continue scene: any other scene that has
-	// rendered a clip, ordered by timeline position.
-	function timelineClipOptions(current: Scene | null): Scene[] {
+	// Timeline source options for a continue clip: any other rendered clip
+	// (clips first, then legacy scene-level paths), ordered by timeline position.
+	function timelineClipOptions(
+		current: Scene | null,
+	): Array<{ label: string; path: string }> {
 		if (!current) return [];
-		return scenes
-			.filter((s) => s.id !== current.id && s.video_path)
-			.sort((a, b) => a.order_index - b.order_index);
+		const out: Array<{ label: string; path: string }> = [];
+		for (const s of scenes) {
+			if (s.id === current.id) continue;
+			for (const [i, c] of (s.clips ?? []).entries()) {
+				if (!c.clip_path) continue;
+				out.push({
+					label: `${s.clips.length > 1 ? `#${s.order_index}.${i + 1}` : `#${s.order_index}`} · ${s.heading || 'scene'}`,
+					path: c.clip_path,
+				});
+			}
+			if ((s.clips?.length ?? 0) === 0 && s.video_path) {
+				out.push({ label: `#${s.order_index} · ${s.heading || 'scene'}`, path: s.video_path });
+			}
+		}
+		return out;
 	}
 
-	const generateOne = createMutation({
-		mutationFn: (vars: { sceneId: number; prompt?: string }) => {
-			const { sceneId } = vars;
+const generateOne = createMutation({
+		mutationFn: (vars: { clipId: number; sceneId: number; prompt?: string }) => {
+			const { clipId, sceneId, prompt } = vars;
 			const scene = scenes.find((s) => s.id === sceneId);
 			const wf = scene ? workflowFor(scene) : undefined;
 			return jobsApi.generateVideos(projectId, {
-				scene_ids: [sceneId],
+				clip_ids: [clipId],
 				workflow_id: selectedWorkflow[sceneId] ?? wf?.id,
 				input_values: compactInputValues(formValues),
-				prompts: vars.prompt ? { [String(sceneId)]: vars.prompt } : undefined,
+				prompts: prompt ? { [String(clipId)]: prompt } : undefined,
 			});
 		},
 		onSuccess: async () => {
@@ -298,15 +374,17 @@
 		onError: (err) => toast.error(err instanceof Error ? err.message : String(err)),
 	});
 
-	// Render-history versioning: make an older job's output the scene's clip.
+	// Render-history versioning: make an older job's output the clip's render.
 	let applyingJob = $state(false);
-	async function applyJobToScene(j: Job, path: string) {
-		if (j.scene_id == null || applyingJob) return;
+	async function applyJobToClip(j: Job, path: string) {
+		if (applyingJob) return;
+		const clipId = clipIdOfJob(j) ?? selectedEntry?.clip.id;
+		if (clipId == null) return;
 		applyingJob = true;
 		try {
-			await projects.updateScene(projectId, j.scene_id, { video_path: path });
+			await projects.updateClip(projectId, clipId, { clip_path: path });
 			await client.invalidateQueries({ queryKey: ['scenes'] });
-			toast.success('Scene clip updated');
+			toast.success('Clip render updated');
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		} finally {
@@ -318,13 +396,13 @@
 	let previewOpen = $state(false);
 
 	function beginGenerate() {
-		if (!selected) return;
+		if (!selClip) return;
 		previewOpen = true;
 	}
 
 	function onGenerateConfirmed(prompt: string) {
-		if (!selected) return;
-		$generateOne.mutate({ sceneId: selected.id, prompt });
+		if (!selClip || !selected) return;
+		$generateOne.mutate({ clipId: selClip.id, sceneId: selected.id, prompt });
 	}
 
 	// --- Batch generate: queue clips one by one, in timeline order. ---
@@ -337,18 +415,33 @@
 	let batchNote = $state('');
 
 	const scenesNeedingClip = $derived(
-		scenes.filter((s) => !['done', 'pending', 'running'].includes(statusOf(s))),
+		scenes.filter((s) => !['done', 'partial', 'pending', 'running'].includes(sceneStatus(s))),
 	);
 	const batchTargets = $derived(
 		scenesNeedingClip.length > 0
 			? scenesNeedingClip
-			: scenes.filter((s) => !['pending', 'running'].includes(statusOf(s))),
+			: scenes.filter((s) => !['pending', 'running'].includes(sceneStatus(s))),
+	);
+	const clipTotal = $derived(
+		scenes.reduce((n, s) => n + Math.max(s.clips?.length ?? 1, 1), 0),
+	);
+	const clipsReady = $derived(
+		scenes.reduce(
+			(n, s) =>
+				n +
+				((s.clips?.length ?? 0) > 0
+					? s.clips.filter((c) => c.clip_path).length
+					: s.video_path
+						? 1
+						: 0),
+			0,
+		),
 	);
 	const batchLabel = $derived(
 		batching
 			? batchNote
 			: scenesNeedingClip.length > 0
-				? `Generate all (${scenesNeedingClip.length})`
+				? `Generate all (${clipTotal - clipsReady} missing)`
 				: 'Regenerate all',
 	);
 
@@ -358,33 +451,46 @@
 		let queued = 0;
 		let drafted = 0;
 		const targets = [...batchTargets].sort((a, b) => a.order_index - b.order_index);
-		for (let i = 0; i < targets.length; i++) {
-			const scene = targets[i];
-			batchNote = `Queueing ${i + 1}/${targets.length}…`;
-			try {
-				// Resolve like the per-scene button does: session pick → scene's stored
-				// workflow → first enabled video workflow. A scene whose stored workflow
-				// was deleted would otherwise enqueue a job doomed to "No workflow found".
-				// Saved prompt drafts ride along; un-drafted scenes get the backend's
-				// auto-rewrite (deterministic template on LLM failure).
-				const draft = scene.video_settings?.prompt_draft;
-				const draftFresh =
-					draft && scene.video_settings?.prompt_draft_meta?.based_on
-						? scene.video_settings.prompt_draft_meta.based_on
-						: null;
-				await jobsApi.generateVideos(projectId, {
-					scene_ids: [scene.id],
-					workflow_id: workflowFor(scene)?.id,
-					prompts: draft ? { [String(scene.id)]: draft } : undefined,
-				});
-				queued++;
-				if (draft) drafted++;
-				client.invalidateQueries({ queryKey: ['jobs'] });
-				client.invalidateQueries({ queryKey: ['scenes'] });
-			} catch (err) {
-				toast.error(
-					`Scene #${scene.order_index}: ${err instanceof Error ? err.message : String(err)}`,
-				);
+		const totalClips = targets.reduce((n, s) => n + Math.max(s.clips?.length ?? 1, 1), 0);
+		let done = 0;
+		for (const scene of targets) {
+			const clips = scene.clips ?? [];
+			const renderTargets: Array<{ id: number; key: string }> =
+				clips.length > 0
+					? clips.map((c) => ({ id: c.id, key: String(c.id) }))
+					: [{ id: scene.id, key: String(scene.id) }];
+			for (const t of renderTargets) {
+				done++;
+				batchNote = `Queueing ${done}/${totalClips}…`;
+				try {
+					// Resolve like the per-clip button does: session pick → scene's stored
+					// workflow → first enabled video workflow. A scene whose stored workflow
+					// was deleted would otherwise enqueue a job doomed to "No workflow found".
+					// Fresh per-clip drafts ride along; stale/absent drafts get the backend's
+					// auto-rewrite (deterministic template on LLM failure).
+					const clip = clips.length > 0 ? clips.find((c) => c.id === t.id) : null;
+					const draft = clip?.video_settings?.prompt_draft;
+					const draftFresh =
+						draft && clip?.video_settings?.prompt_draft_meta?.based_on
+							? clip.video_settings.prompt_draft_meta.based_on
+							: null;
+					await jobsApi.generateVideos(projectId, {
+						clip_ids: clip ? [t.id] : undefined,
+						scene_ids: clip ? undefined : [t.id],
+						workflow_id: workflowFor(scene)?.id,
+						prompts: draft ? { [t.key]: draft } : undefined,
+					});
+					queued++;
+					if (draft) drafted++;
+					client.invalidateQueries({ queryKey: ['jobs'] });
+					client.invalidateQueries({ queryKey: ['scenes'] });
+				} catch (err) {
+					const label =
+						clips.length > 0
+							? `Clip #${scene.order_index}.${(clips.findIndex((c) => c.id === t.id) ?? 0) + 1}`
+							: `Scene #${scene.order_index}`;
+					toast.error(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+				}
 			}
 		}
 		batching = false;
@@ -404,45 +510,105 @@
 		return enabledWorkflows.find((w) => w.id === id) ?? enabledWorkflows[0] ?? undefined;
 	}
 
+	// Clip-aware helpers: jobs are clip-addressed (job.clip_id); legacy rows
+	// without clip_id fall back to scene addressing (1:1 projects keep working).
+	function clipIdOfJob(j: Job): number | null {
+		return j.clip_id ?? null;
+	}
+
+	function jobForClipId(clipId: number): Job | undefined {
+		const jobs = ($jobsQuery.data ?? []).filter((j) => clipIdOfJob(j) === clipId && j.kind === 'video');
+		if (jobs.length === 0) return undefined;
+		return [...jobs].sort((a, b) => b.id - a.id)[0];
+	}
+
+	/** Latest video job for a scene (legacy fallback + history views). */
 	function jobForScene(sceneId: number): Job | undefined {
 		const jobs = ($jobsQuery.data ?? []).filter((j) => j.scene_id === sceneId && j.kind === 'video');
 		if (jobs.length === 0) return undefined;
 		return [...jobs].sort((a, b) => b.id - a.id)[0];
 	}
 
-	function statusOf(scene: Scene): string {
+	/** Any pending/running video job inside this scene (any of its clips). */
+	function sceneBusy(scene: Scene): boolean {
+		return ($jobsQuery.data ?? []).some(
+			(j) =>
+				j.kind === 'video' &&
+				j.scene_id === scene.id &&
+				(j.status === 'pending' || j.status === 'running'),
+		);
+	}
+
+	function sceneStatus(scene: Scene): string {
+		if (sceneBusy(scene)) return 'running';
+		const clips = scene.clips ?? [];
+		if (clips.length > 0) {
+			if (clips.every((c) => c.clip_path)) return 'done';
+			if (clips.some((c) => c.clip_path)) return 'partial';
+			return 'idle';
+		}
 		const job = jobForScene(scene.id);
 		if (job) return job.status;
 		if (scene.video_path) return 'done';
 		return 'idle';
 	}
 
-	function previewPath(scene: Scene): string | null {
-		const job = jobForScene(scene.id);
-		// While a new job is queued/running, don't keep showing the previous clip
-		if (job && (job.status === 'pending' || job.status === 'running')) return null;
-		// scene.video_path is the source of truth — it reflects the clip the user
-		// applied ("Apply to Scene"), which may be an older render than the newest job.
-		if (scene.video_path && /\.(mp4|webm)$/i.test(scene.video_path)) return scene.video_path;
-		// Fallback: latest finished job (e.g. output not filed onto the scene yet).
-		if (job?.status === 'done') {
-			const fromJob = (job.output_paths ?? []).find((p) => /\.(mp4|webm)$/i.test(p));
-			if (fromJob) return fromJob;
+	function clipBusy(clipId: number): boolean {
+		const job = jobForClipId(clipId);
+		return job?.status === 'pending' || job?.status === 'running';
+	}
+
+	function statusOfClip(clipId: number): string {
+		if (clipBusy(clipId)) return 'running';
+		const entry = filmClips.find((c) => c.clip.id === clipId);
+		if (!entry) return 'idle';
+		if (entry.clip.clip_path) return 'done';
+		const job = jobForClipId(clipId);
+		if (job) return job.status;
+		// Un-expanded/legacy clip mirrors its scene row.
+		if (entry.index === 0 && entry.scene.video_path && (entry.scene.clips?.length ?? 0) <= 1) {
+			return 'done';
+		}
+		return 'idle';
+	}
+
+	/** Playback label: '#3' for a scene's only clip, '#3.2' for shot 2 of 3+. */
+	function clipLabel(scene: Scene, index: number): string {
+		return (scene.clips?.length ?? 0) > 1
+			? `#${scene.order_index}.${index + 1}`
+			: `#${scene.order_index}`;
+	}
+
+	type Thumb = { kind: 'image' | 'video'; src: string } | null;
+
+	function thumbForClip(clipId: number): Thumb | null {
+		const entry = filmClips.find((c) => c.clip.id === clipId);
+		if (!entry) return null;
+		if (entry.clip.clip_path && /\.(mp4|webm)$/i.test(entry.clip.clip_path)) {
+			const src = assetUrl(entry.clip.clip_path);
+			if (src) return { kind: 'video', src };
+		}
+		if (entry.index === 0 && entry.scene.env_image_path) {
+			const src = assetUrl(entry.scene.env_image_path);
+			if (src) return { kind: 'image', src };
 		}
 		return null;
 	}
 
-	type Thumb = { kind: 'image' | 'video'; src: string };
-
-	function thumbFor(scene: Scene): Thumb | null {
-		if (scene.env_image_path) {
-			const src = assetUrl(scene.env_image_path);
-			if (src) return { kind: 'image', src };
-		}
-		const preview = previewPath(scene);
-		if (preview) {
-			const src = assetUrl(preview);
-			if (src) return { kind: 'video', src };
+	function previewPathForClip(clipId: number): string | null {
+		const entry = filmClips.find((c) => c.clip.id === clipId);
+		if (!entry) return null;
+		if (clipBusy(clipId)) return null;
+		const path = entry.clip.clip_path;
+		if (path && /\.(mp4|webm)$/i.test(path)) return path;
+		// Legacy un-expanded clip: the scene row mirrors the render.
+		if (
+			entry.index === 0 &&
+			(entry.scene.clips?.length ?? 0) <= 1 &&
+			entry.scene.video_path &&
+			/\.(mp4|webm)$/i.test(entry.scene.video_path)
+		) {
+			return entry.scene.video_path;
 		}
 		return null;
 	}
@@ -470,7 +636,7 @@
 		return `${Math.round(months / 12)}y ago`;
 	}
 
-	const doneCount = $derived(scenes.filter((s) => statusOf(s) === 'done').length);
+	const doneCount = $derived(clipsReady);
 
 	async function togglePause() {
 		if ($queueStatusQuery.data?.paused) await jobsApi.resume();
@@ -483,28 +649,33 @@
 		client.invalidateQueries({ queryKey: ['queue-status'] });
 	}
 
-	function selectScene(id: number) {
-		selectedId = id;
+	/** Select a clip; the parent scene follows for the script drawer + form. */
+	function selectClip(id: number) {
+		selectedClipId = id;
 	}
 
-	// Filmstrip click → jump back to the editor with that scene selected.
+	// Filmstrip click → jump back to the editor with that clip selected.
 	function editScene(id: number) {
-		selectedId = id;
-		view = 'edit';
+		const entry = allClips.find((c) => c.scene.id === id);
+		if (entry) {
+			selectedClipId = entry.clip.id;
+			view = 'edit';
+		}
 	}
 
-	function neighborId(dir: -1 | 1): number | null {
-		const idx = scenes.findIndex((s) => s.id === selectedId);
-		const next = scenes[(idx < 0 ? 0 : idx) + dir];
-		return next?.id ?? null;
+	function neighborClipId(dir: -1 | 1): number | null {
+		const idx = allClips.findIndex((c) => c.clip.id === selectedClipId);
+		const next = allClips[(idx < 0 ? 0 : idx) + dir];
+		return next?.clip.id ?? null;
 	}
 
 	function step(dir: -1 | 1) {
-		const id = neighborId(dir);
-		if (id != null) selectedId = id;
+		const id = neighborClipId(dir);
+		if (id != null) selectedClipId = id;
 	}
 
-	const selJob = $derived(selected ? jobForScene(selected.id) : undefined);
+	const selClip = $derived(selectedEntry?.clip ?? null);
+	const selJob = $derived(selClip ? jobForClipId(selClip.id) : undefined);
 	const selProg = $derived(selJob ? progressFor(selJob.id) : undefined);
 	const selError = $derived(selJob?.error ?? '');
 	const selErrorLong = $derived(selError.length > 140 || selError.split('\n').length > 3);
@@ -537,8 +708,7 @@
 				Date.parse(j.completed_at) > exportAt,
 		);
 	});
-	const clipsReady = $derived(scenes.filter((s) => Boolean(s.video_path)).length);
-	const clipsMissing = $derived(scenes.length - clipsReady);
+	const clipsMissing = $derived(clipTotal - clipsReady);
 
 	type ExportState = 'idle' | 'active' | 'ready' | 'failed';
 	const exportState = $derived.by((): ExportState => {
@@ -606,7 +776,7 @@
 			{#if scenes.length === 0}
 				Build a script first, then cut clips on the timeline.
 			{:else}
-				{doneCount}/{scenes.length} clips done · {formatClock(totalSec)} total
+				{doneCount}/{clipTotal} clips done · {formatClock(totalSec)} total · {scenes.length} scenes
 			{/if}
 		</p>
 	</div>
@@ -672,14 +842,14 @@
 		</div>
 	{:else if selected}
 		{@const selWf = workflowFor(selected)}
-		{@const selStatus = statusOf(selected)}
-		{@const selPreview = previewPath(selected)}
+		{@const selStatus = selClip ? statusOfClip(selClip.id) : sceneStatus(selected)}
+		{@const selPreview = selClip ? previewPathForClip(selClip.id) : null}
 		{@const selHasVideoInput = workflowHasVideoInput(selWf)}
 		{@const selVideoNode = videoInputNodeFor(selWf)}
 		{@const selClips = timelineClipOptions(selected)}
-		{@const selChain = Boolean(selected.chain_from_prev)}
+		{@const selChain = Boolean(selClip?.chain_from_prev ?? selected.chain_from_prev)}
 		{@const selSource = clipSource[selected.id] ?? 'auto'}
-		{@const selSourceValid = selSource === 'auto' || selSource === 'upload' || selClips.some((s) => String(s.id) === selSource)}
+		{@const selSourceValid = selSource === 'auto' || selSource === 'upload' || selClips.some((o) => o.path === selSource)}
 		{@const selBlocked = selChain && !selHasVideoInput}
 		<input
 			bind:this={videoFileInput}
@@ -690,16 +860,18 @@
 		/>
 		<VideoEditWorkspace
 			{scenes}
+			{filmClips}
+			selectedClip={selectedEntry}
+			{selectedClipId}
 			{selected}
-			{selectedId}
 			status={selStatus}
 			previewPath={selPreview}
 			progress={selProg}
 			error={selError}
 			errorLong={selErrorLong}
 			job={selJob}
-			sceneJobs={($jobsQuery.data ?? []).filter(
-				(j) => j.scene_id === selected.id && j.kind === 'video',
+			clipJobs={($jobsQuery.data ?? []).filter(
+				(j) => selClip != null && clipIdOfJob(j) === selClip.id && j.kind === 'video',
 			)}
 			workflow={selWf}
 			workflows={enabledWorkflows}
@@ -707,23 +879,22 @@
 			{assetOptions}
 			allowUpload
 			submitting={$generateOne.isPending}
-			{statusOf}
-			{thumbFor}
+			statusOfClip={statusOfClip}
+			thumbForClip={thumbForClip}
 			{formatClock}
-			chained={(scene) => Boolean(scene.chain_from_prev)}
-			onApplyToScene={(j, path) => applyJobToScene(j, path)}
+			onApplyToClip={(j, path) => applyJobToClip(j, path)}
 			applying={applyingJob}
 			generateDisabled={selBlocked}
 			generateDisabledReason={selBlocked
-				? 'This scene continues from the previous video — pick a workflow with a video input'
+				? 'This clip continues from the previous video — pick a workflow with a video input'
 				: ''}
 			clipSource={{
 				enabled: selChain && selHasVideoInput && Boolean(selVideoNode),
 				value: selSourceValid ? selSource : 'auto',
-				options: selClips.map((s) => ({
-					id: String(s.id),
-					label: `#${s.order_index} ${s.heading || 'Scene'}`,
-					path: s.video_path ?? undefined,
+				options: selClips.map((o) => ({
+					id: o.path,
+					label: o.label,
+					path: o.path,
 				})),
 			}}
 			onClipSourceChange={(val) => {
@@ -737,25 +908,27 @@
 					clipSource = { ...clipSource, [selected.id]: 'upload' };
 				} else {
 					clipSource = { ...clipSource, [selected.id]: val };
-					const clip = selClips.find((s) => String(s.id) === val);
-					if (clip?.video_path && selVideoNode) {
-						formValues = { ...formValues, [selVideoNode.nodeId]: clip.video_path };
+					if (selVideoNode) {
+						formValues = { ...formValues, [selVideoNode.nodeId]: val };
 					}
 				}
 			}}
 			onClipSourceUpload={() => videoFileInput?.click()}
-			onSelect={selectScene}
+			onSelectClip={selectClip}
 			onStep={step}
 			onWorkflowChange={(id) => {
 				selectedWorkflow = { ...selectedWorkflow, [selected.id]: Number(id) };
 			}}
-		onGenerate={() => $generateOne.mutate({ sceneId: selected.id })}
+		onGenerate={() => {
+			if (selClip) $generateOne.mutate({ clipId: selClip.id, sceneId: selected.id });
+		}}
 		onPreviewPrompt={beginGenerate}
 	/>
 
 	<PromptPreviewModal
 		bind:open={previewOpen}
 		{projectId}
+		clip={selClip}
 		scene={selected}
 		workflow={selWf}
 		inputValues={formValues}
@@ -830,7 +1003,7 @@
 						<p class="slate-warn" role="status">
 							<Icon name="alert" size={14} />
 							<span>
-								{clipsMissing} scene{clipsMissing === 1 ? '' : 's'} without a clip will be skipped
+								{clipsMissing} clip{clipsMissing === 1 ? '' : 's'} without a render will be skipped
 							</span>
 						</p>
 					{/if}
@@ -871,17 +1044,17 @@
 			</div>
 		{/if}
 
-		{#if scenes.length > 0}
+		{#if filmClips.length > 0}
 			<div class="filmstrip-block">
 				<p class="filmstrip-label">In this film</p>
 				<div class="filmstrip">
-					{#each scenes as scene (scene.id)}
-						{@const thumb = thumbFor(scene)}
+					{#each filmClips as entry (entry.clip.id)}
+						{@const thumb = thumbForClip(entry.clip.id)}
 						<button
 							type="button"
 							class="filmstrip-item"
-							title={`${scene.heading || 'Scene'} — edit in timeline`}
-							onclick={() => editScene(scene.id)}
+							title={`${entry.scene.heading || 'Scene'} ${entry.label} — edit in timeline`}
+							onclick={() => editScene(entry.scene.id)}
 						>
 							{#if thumb?.kind === 'image'}
 								<img class="filmstrip-media" src={thumb.src} alt="" loading="lazy" />
@@ -889,9 +1062,9 @@
 								<!-- svelte-ignore a11y_media_has_caption -->
 								<video class="filmstrip-media" src={thumb.src} muted playsinline preload="metadata"></video>
 							{:else}
-								<span class="filmstrip-slate">#{scene.order_index}</span>
+								<span class="filmstrip-slate">{entry.label}</span>
 							{/if}
-							<span class="filmstrip-num">#{scene.order_index}</span>
+							<span class="filmstrip-num">{entry.label}</span>
 						</button>
 					{/each}
 				</div>

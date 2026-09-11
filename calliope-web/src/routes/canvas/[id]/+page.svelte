@@ -106,10 +106,18 @@
 		}
 		if (node.entity_type === 'scene') {
 			const s = scenes.find((x) => x.id === node.entity_id);
-			// Project > Videos pattern: env image poster, clip fallback; only
-			// real video files count (guard mirrors QueueStage.previewPath).
-			const clip =
-				s?.video_path && /\.(mp4|webm)$/i.test(s.video_path) ? s.video_path : null;
+			// Project > Videos pattern: env image poster, first ready clip
+			// fallback; only real video files count (guard mirrors
+			// QueueStage.previewPath). A scene's clips are the renderables —
+			// the card plays the scene's first ready clip.
+			const firstReady = (s?.clips ?? []).find(
+				(c) => c.clip_path && /\.(mp4|webm)$/i.test(c.clip_path),
+			);
+			const clip = firstReady?.clip_path
+				? firstReady.clip_path
+				: s?.video_path && /\.(mp4|webm)$/i.test(s.video_path)
+					? s.video_path
+					: null;
 			return { imagePath: s?.env_image_path ?? null, videoPath: clip };
 		}
 		return { imagePath: null, videoPath: null };
@@ -352,6 +360,9 @@
 	let activeId = $state<number | null>(null);
 	let streaming = $state('');
 	let streamingReasoning = $state('');
+	// Tracks which agent produced the last reasoning delta so the name prefix
+	// is written once per transition, not per token.
+	let thinkingAgent: string | null = null;
 	let liveTools = $state<
 		{ tool: string; args?: Record<string, unknown> | null; result?: unknown; phase: 'running' | 'done' | 'error' }[]
 	>([]);
@@ -486,6 +497,7 @@
 	function resetLiveViews() {
 		streaming = '';
 		streamingReasoning = '';
+		thinkingAgent = null;
 		liveTools = [];
 		livePlan = null;
 		composerDraft = '';
@@ -570,6 +582,7 @@
 		onMutate: () => {
 			streaming = '';
 			streamingReasoning = '';
+			thinkingAgent = null;
 			liveTools = [];
 			livePlan = null;
 			if (activeId != null) {
@@ -674,6 +687,7 @@
 						if (msg.role === 'assistant' && !msg.agent_name) {
 							streaming = '';
 							streamingReasoning = '';
+							thinkingAgent = null;
 						}
 					}
 				}
@@ -683,7 +697,16 @@
 					streaming += String(ev.data?.content ?? '');
 				}
 			} else if (ev.type === 'agent.thinking') {
-				if (ev.data?.session_id === activeId && !ev.data?.agent_name) {
+				// Reasoning is auxiliary: stream it from ANY agent (incl.
+				// sub-agents) — the old `!agent_name` filter left delegated
+				// turns as a bare "working..." card. Prefix only on agent
+				// change; deltas arrive per token.
+				if (ev.data?.session_id === activeId) {
+					const name = (ev.data?.agent_name as string | undefined) ?? null;
+					if (name !== thinkingAgent) {
+						streamingReasoning += `${name ? `${name}: ` : ''}`;
+						thinkingAgent = name;
+					}
 					streamingReasoning += String(ev.data?.content ?? '');
 				}
 			} else if (ev.type === 'agent.tool') {

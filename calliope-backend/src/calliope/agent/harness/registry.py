@@ -21,6 +21,30 @@ from calliope.config import settings
 from calliope.db import get_db, row_to_dict
 from calliope.events.bus import event_bus
 
+# ─────────────────────────────────────────────────────────────────────────
+# Scene tool scope (Build Scene surface)
+# ─────────────────────────────────────────────────────────────────────────
+
+# Build Scene sessions (origin='scene') are the 3D blockout surface: their
+# toolset is the shot_* set plus this minimal base. Enforced at BOTH payload
+# assembly and execute time (same two-layer pattern as requires_project).
+# Defined here (not harness/__init__) to avoid a circular import; re-exported
+# there for tests/UI consumers.
+GUARD_SCENE_TOOL_SCOPE = "guard_scene_tool_scope"
+_SCENE_ALLOWED_CATEGORIES = {"shot"}
+_SCENE_ALLOWED_TOOLS = {
+    "ask_user",
+    "list_skills",
+    "read_skill",
+    "save_memory",
+    "list_memories",
+    "forget_memory",
+}
+
+
+def _scene_scoped(t: "ToolDefinition") -> bool:
+    return getattr(t, "category", None) in _SCENE_ALLOWED_CATEGORIES or t.name in _SCENE_ALLOWED_TOOLS
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Context & definitions
@@ -30,10 +54,14 @@ from calliope.events.bus import event_bus
 @dataclass
 class ToolContext:
     """Per-run context. `project_id` is the session's workspace binding:
-    None means a blind/sandbox session (only project-creating tools allowed)."""
+    None means a blind/sandbox session (only project-creating tools allowed).
+    `origin` stamps WHERE the session was born ('chat' | 'scene') — scene
+    sessions are Build Scene's blockout surface and get the shot-tool-only
+    payload; it says nothing about project linking."""
 
     session_id: int
     project_id: int | None = None
+    origin: str = "chat"
 
 
 @dataclass
@@ -121,6 +149,10 @@ class ToolRegistry:
             return False
         if t.blind_only and ctx.project_id is not None:
             return False
+        # Build Scene surface: shot tools + minimal base ONLY. A missing tool
+        # is harder to misuse than one that fails at execute time.
+        if ctx.origin == "scene" and not _scene_scoped(t):
+            return False
         # Hide render tools until the user asks — the model still "knows"
         # run_workflow from earlier turns, but a missing tool is harder to
         # call than one that only fails in pre-execute (HITL cards).
@@ -168,6 +200,19 @@ class ToolRegistry:
                 "error": (
                     "This tool is only available in a sandbox (unlinked) session. "
                     "Call unlink_project first to return this session to sandbox."
+                ),
+            }
+        if ctx.origin == "scene" and not _scene_scoped(t):
+            return {
+                "ok": False,
+                "reason_code": GUARD_SCENE_TOOL_SCOPE,
+                "error": (
+                    "This is a Build Scene session: only the 3D blockout tools "
+                    "(get_scene, add_object, set_transform, set_joint, add_keyframe, "
+                    "set_shot, …) are available here. Build and pose the scene, then "
+                    "use Capture / Export video — the blockout clip is picked as a "
+                    "reference input from the Playground media library, not generated "
+                    "from this chat."
                 ),
             }
 

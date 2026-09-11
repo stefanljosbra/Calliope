@@ -43,7 +43,7 @@ let {
 }: Props = $props();
 
 	const ATTACH_LIMIT = 8;
-	const ACCEPT = 'image/*,video/*,audio/*,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mov,.mkv,.mp3,.wav,.flac,.ogg,.m4a';
+	const ACCEPT = 'image/*,video/*,audio/*,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mov,.mkv,.mp3,.wav,.flac,.ogg,.m4a,.txt,.md,.docx';
 
 	let editorEl = $state<HTMLDivElement | null>(null);
 	let fileInput = $state<HTMLInputElement | null>(null);
@@ -498,6 +498,10 @@ let {
 						{#if src}
 							<img src={src} alt={a.name} />
 						{/if}
+					{:else if a.kind === 'document'}
+						<span class="tile-icon">
+							<Icon name="file" size={16} />
+						</span>
 					{:else}
 						<span class="tile-icon">
 							<Icon name={a.kind === 'audio' ? 'music' : 'video'} size={16} />

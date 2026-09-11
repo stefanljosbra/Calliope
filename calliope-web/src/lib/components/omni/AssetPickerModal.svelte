@@ -94,6 +94,7 @@
 		if (tab === 'character') return 'No character sheets yet. Generate them on Assets.';
 		if (tab === 'location') return 'No environment images yet. Generate them on Assets.';
 		if (tab === 'item') return 'No misc. item images yet. Generate them on Assets.';
+		if (tab === 'shot') return 'No Build Scene captures yet. Capture blockouts on the Build Scene page.';
 		if (tab === 'clip') return 'No scene clips in this film yet.';
 		return allowUpload ? 'No uploads yet. Use Upload new… below.' : 'No uploads yet.';
 	});
