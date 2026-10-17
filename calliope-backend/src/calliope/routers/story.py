@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from calliope.agent.idea_guard import LongSourceText, refuse_long_idea
 from calliope.agent.llm import generate_structured
 from calliope.agent.prompts import (
     STORY_GENERATION_SYSTEM,
@@ -253,6 +254,12 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
     try:
         project = _require_project(conn, project_id)
 
+        # Before any prompt is built, so a refusal costs no tokens. This is the
+        # one built-in generator that would overwrite a CLI-authored beat list
+        # (`replace=True` deletes story_beats/cast), so the burn is the smaller
+        # half of the problem.
+        refuse_long_idea(project, generator="storyline generator")
+
         required_beats = recommend_beat_count(project.get("target_duration"))
         await event_bus.publish(
             "agent.thinking",
@@ -272,6 +279,11 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
         logline: str | None = None
         written = 0
         replace_started = False
+        # What was actually inserted. Reported back to the caller AND used as
+        # the post-condition check: the agent reads this dict and decides
+        # whether the goal is met, so under-reporting here makes it skip work
+        # that was done, and over-reporting hides work that was not.
+        seeded = {"characters": 0, "locations": 0, "items": 0}
 
         async for chunk in _iter_story_chunks(project_id, project, required_beats):
             if title is None:
@@ -324,6 +336,7 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
                                 "consistency_prompt": character_sheet_prompt(row_seed),
                             },
                         )
+                        seeded["characters"] += 1
                     elif seed_kind == "locations":
                         description = entity.get("description", "") or ""
                         loc_seed = {"name": entity.get("name", ""), "description": description}
@@ -338,6 +351,7 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
                                 "consistency_prompt": location_reference_prompt(loc_seed),
                             },
                         )
+                        seeded["locations"] += 1
                     else:
                         description = entity.get("description", "") or ""
                         item_seed = {"name": entity.get("name", ""), "description": description}
@@ -352,6 +366,7 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
                                 "consistency_prompt": item_reference_prompt(item_seed),
                             },
                         )
+                        seeded["items"] += 1
 
             for beat in chunk.get("beats") or []:
                 conn.execute(
@@ -394,12 +409,38 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
             "story.ready",
             {
                 "project_id": project_id,
-                "message": f"Story drafted — {beat_n} beats",
+                "message": (
+                    f"Story drafted — {beat_n} beats, "
+                    f"{seeded['characters']} characters, "
+                    f"{seeded['locations']} locations, {seeded['items']} items"
+                ),
             },
         )
-        return {"ok": True, "project_id": project_id, "generated": {"beats": beat_n}}
+        # Report EVERY table that was written. This dict is the agent's only
+        # evidence of what exists: reporting `{"beats": 50}` alone made a story
+        # agent conclude the cast had not been created and stop without adding
+        # it (observed 2026-10-03, project 3 — the LLM had returned 4 characters
+        # and they were inserted, but the tool said "beats" and the agent moved
+        # on). Silent zero counts are the failure mode to avoid: an agent must be
+        # able to see that the cast came back empty and retry it.
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "generated": {
+                "beats": beat_n,
+                "characters": seeded["characters"],
+                "locations": seeded["locations"],
+                "items": seeded["items"],
+            },
+        }
     except HTTPException:
         raise
+    except LongSourceText as exc:
+        # A refusal, not a failure. 422 with no traceback and no
+        # "Story draft failed" -- the caller asked for something the guard has
+        # already explained, and logging a stack trace for it would train
+        # everyone to ignore the log.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Story generation failed for project %s", project_id)
         await event_bus.publish(
@@ -416,7 +457,8 @@ async def get_story(project_id: int) -> dict[str, Any]:
     conn = get_db(settings.db_path)
     try:
         project = conn.execute(
-            "SELECT id, title, idea, genre, tone, target_duration, status FROM projects WHERE id = ?",
+            "SELECT id, title, idea, genre, tone, target_duration, status, ingest_mode"
+            " FROM projects WHERE id = ?",
             (project_id,),
         ).fetchone()
         if not project:

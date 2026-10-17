@@ -63,6 +63,10 @@
 
 	const scenes = $derived($scenesQuery.data?.scenes ?? []);
 	const sceneCount = $derived(scenes.length);
+	// See StoryStage: a CLI-authored board is not something the built-in script
+	// generator should be able to overwrite, so its button is removed rather
+	// than left to fail with a 422.
+	const externallyAuthored = $derived($storyQuery.data?.project?.ingest_mode === 'external');
 	const totalClips = $derived(scenes.reduce((n, s) => n + (s.clips?.length ?? 0), 0));
 	const totalSec = $derived($scenesQuery.data?.estimated_duration_sec ?? 0);
 	const targetSec = $derived.by(() => {
@@ -148,23 +152,6 @@
 			toast.error(err instanceof Error ? err.message : t('script.toast.saveSceneFail'));
 		},
 	});
-
-	// Chain-from-previous toggle — persists on the scene; consumed at render time.
-	let chainPendingId = $state<number | null>(null);
-	async function toggleChain(scene: Scene) {
-		if (chainPendingId != null) return;
-		chainPendingId = scene.id;
-		try {
-			await projects.updateScene(projectId, scene.id, {
-				chain_from_prev: !scene.chain_from_prev,
-			});
-			await client.invalidateQueries({ queryKey: ['scenes'] });
-		} catch (err) {
-			toast.error(err instanceof Error ? err.message : t('script.toast.updateSceneFail'));
-		} finally {
-			chainPendingId = null;
-		}
-	}
 
 	function jobForScene(sceneId: number): Job | undefined {
 		const jobs = ($jobsQuery.data ?? []).filter(
@@ -349,9 +336,16 @@
 		>
 			<Icon name="film" size={14} /> {t('script.breakAllIntoShots')}
 		</Button>
-		<Button variant="primary" disabled={busy} onclick={requestRegenerate}>
-			<Icon name="sparkle" size={15} /> {t('script.regenerate')}
-		</Button>
+		{#if externallyAuthored}
+			<!-- "Break into shots" deliberately stays. It never reads the source
+			     text, so it costs no model call on a novel and it is the one
+			     built-in pass that legitimately refines a CLI-authored board. -->
+			<p class="externally-authored">{t('script.externallyAuthored')}</p>
+		{:else}
+			<Button variant="primary" disabled={busy} onclick={requestRegenerate}>
+				<Icon name="sparkle" size={15} /> {t('script.regenerate')}
+			</Button>
+		{/if}
 	</div>
 </header>
 
@@ -509,19 +503,6 @@
 					{#if scene.duration_sec}
 						<span class="chip"><Icon name="clock" size={12} /> {formatClock(scene.duration_sec)}</span>
 					{/if}
-					{#if i > 0}
-						<button
-							type="button"
-							class="chip chip-toggle"
-							class:chip-on={Boolean(scene.chain_from_prev)}
-							disabled={chainPendingId === scene.id}
-						title={t('script.chainTitle')}
-						onclick={() => toggleChain(scene)}
-					>
-						<Icon name="film" size={12} />
-						{Boolean(scene.chain_from_prev) ? t('script.chainOn') : t('script.chainOff')}
-						</button>
-					{/if}
 				</div>
 			</article>
 		{/each}
@@ -611,6 +592,14 @@
 	.stage-actions {
 		display: flex;
 		gap: 8px;
+		align-items: center;
+	}
+	.externally-authored {
+		color: var(--text-secondary);
+		font-size: 12px;
+		margin: 0;
+		max-width: 32ch;
+		line-height: 1.4;
 	}
 	.muted {
 		color: var(--text-secondary);

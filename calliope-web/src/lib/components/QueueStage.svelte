@@ -15,9 +15,8 @@
 		type Workflow,
 	} from '$lib/api';
 	import { compactInputValues } from '$lib/comfy/promptInput';
-	import { createUploadManager } from '$lib/comfy/useUpload.svelte';
 	import { normalizeInputRole } from '$lib/comfy/parser';
-	import type { ComfyDynamicInput } from '$lib/comfy/types';
+	import { carryValuesAcrossWorkflows, sanitizeWorkflowValues } from '$lib/comfy/carryValues';
 	import type { AssetOption } from '$lib/assetPicker';
 	import { shotApi } from '$lib/shot/api';
 	import { progressFor } from '$lib/jobProgress';
@@ -47,25 +46,6 @@
 	// clip ids; hydrated from clip.workflow_id / saved video_settings.
 	let selectedWorkflow = $state<Record<number, number>>({});
 	let lastFormScene = $state<number | null>(null);
-	// Clip source for continue scenes, keyed per scene: 'auto' | 'upload' | scene id.
-	let clipSource = $state<Record<number, string>>({});
-	// Hidden file input backing "Upload file" in the video source modal.
-	let videoFileInput = $state<HTMLInputElement | null>(null);
-	const videoUploadMgr = createUploadManager();
-
-	async function onVideoFileChosen(e: Event) {
-		const el = e.currentTarget as HTMLInputElement;
-		const file = el.files?.[0];
-		el.value = '';
-		const node = videoInputNodeFor(
-			selectedEntry ? workflowForClip(selectedEntry.clip, selectedEntry.scene) : undefined,
-		);
-		if (!file || !selectedEntry || !node) return;
-		const path = await videoUploadMgr.uploadSafe(node.nodeId, file);
-		if (path) {
-			formValues = { ...formValues, [node.nodeId]: path };
-		}
-	}
 
 	// Per-scene input cache — switching scenes no longer wipes the form.
 	const formCache = new Map<number, Record<string, string | number>>();
@@ -245,19 +225,22 @@
 				}
 			}
 			const stored = formCache.get(id);
+			// Saved setups can carry another workflow's values (pre-fix workflow switches), so
+			// drop the impossible ones and let this workflow's defaults apply again.
+			const schema = workflowForClip(entry.clip, entry.scene)?.input_schema;
 			if (stored) {
-				formValues = { ...stored };
+				formValues = sanitizeWorkflowValues({ ...stored }, schema);
 			} else if (entry.clip.video_settings?.input_values) {
 				// First open of a persisted clip setup: hydrate from the clip row.
 				formValues = {
 					...seedClipDefaults(entry),
-					...entry.clip.video_settings.input_values,
+					...sanitizeWorkflowValues(entry.clip.video_settings.input_values, schema),
 				};
 			} else if (entry.scene.video_settings?.input_values) {
 				// Legacy un-expanded clip: scene row carries the setup.
 				formValues = {
 					...seedClipDefaults(entry),
-					...entry.scene.video_settings.input_values,
+					...sanitizeWorkflowValues(entry.scene.video_settings.input_values, schema),
 				};
 			} else {
 				formValues = { ...seedClipDefaults(entry) };
@@ -283,8 +266,6 @@
 		// display hydration; the clips.workflow_id column is written alongside.
 		const wfId = selectedWorkflow[selectedEntry.clip.id];
 		if (wfId) out.form_workflow_id = wfId;
-		const src = clipSource[selectedEntry.scene.id];
-		if (src) out.clip_source = src;
 		const draft = selectedEntry.clip.video_settings?.prompt_draft;
 		const meta = selectedEntry.clip.video_settings?.prompt_draft_meta;
 		if (draft) {
@@ -300,7 +281,7 @@
 
 	$effect(() => {
 		// Track the pieces that make up the persisted settings.
-		const _unused = [formValues, selectedWorkflow, clipSource, selectedEntry?.clip.id];
+		const _unused = [formValues, selectedWorkflow, selectedEntry?.clip.id];
 		void _unused;
 		if (!selectedEntry || saveTimer) return;
 		saveTimer = setTimeout(() => {
@@ -347,40 +328,7 @@
 		return seed;
 	}
 
-	function workflowHasVideoInput(wf: Workflow | undefined): boolean {
-		return Boolean(
-			wf?.input_schema?.some((inp) => normalizeInputRole(inp.role ?? null) === 'video'),
-		);
-	}
-
-	function videoInputNodeFor(wf: Workflow | undefined): ComfyDynamicInput | undefined {
-		return wf?.input_schema?.find((inp) => normalizeInputRole(inp.role ?? null) === 'video');
-	}
-
-	// Timeline source options for a continue clip: any other rendered clip
-	// (clips first, then legacy scene-level paths), ordered by timeline position.
-	function timelineClipOptions(
-		current: Scene | null,
-	): Array<{ label: string; path: string }> {
-		if (!current) return [];
-		const out: Array<{ label: string; path: string }> = [];
-		for (const s of scenes) {
-			if (s.id === current.id) continue;
-			for (const [i, c] of (s.clips ?? []).entries()) {
-				if (!c.clip_path) continue;
-				out.push({
-					label: `${s.clips.length > 1 ? `#${s.order_index}.${i + 1}` : `#${s.order_index}`} · ${s.heading || t('queue.sceneLabel')}`,
-					path: c.clip_path,
-				});
-			}
-			if ((s.clips?.length ?? 0) === 0 && s.video_path) {
-				out.push({ label: `#${s.order_index} · ${s.heading || t('queue.sceneLabel')}`, path: s.video_path });
-			}
-		}
-		return out;
-	}
-
-const generateOne = createMutation({
+	const generateOne = createMutation({
 	mutationFn: (vars: { clipId: number; sceneId: number; prompt?: string }) => {
 		const { clipId, sceneId, prompt } = vars;
 		const scene = scenes.find((s) => s.id === sceneId);
@@ -419,6 +367,22 @@ const generateOne = createMutation({
 		}
 	}
 
+	// H3 motion-context chains: "Start a new chain here". Written straight to the
+	// clip; the form autosave never sends chain_start, and the backend keeps the
+	// stored value when a payload omits it.
+	async function setChainStart(clipId: number, value: boolean) {
+		const clip = allClips.find((c) => c.clip.id === clipId)?.clip;
+		if (!clip) return;
+		try {
+			await projects.updateClip(projectId, clipId, {
+				video_settings: { ...(clip.video_settings ?? {}), chain_start: value },
+			});
+			await client.invalidateQueries({ queryKey: ['scenes'] });
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		}
+	}
+
 	// --- HITL review gate (issue #27) ---
 	let previewOpen = $state(false);
 
@@ -440,6 +404,13 @@ const generateOne = createMutation({
 	// clip at enqueue or run time on the backend.
 	let batching = $state(false);
 	let batchNote = $state('');
+	let compiling = $state(false);
+	let compileNote = $state('');
+
+	/** Every clip in the project, in playback order — the batch compile targets. */
+	const allClipIds = $derived(
+		scenes.flatMap((s) => (s.clips?.length ? s.clips.map((c) => c.id) : [])),
+	);
 
 	const scenesNeedingClip = $derived(
 		scenes.filter((s) => !['done', 'partial', 'pending', 'running'].includes(sceneStatus(s))),
@@ -531,6 +502,45 @@ const generateOne = createMutation({
 		}
 		await client.invalidateQueries({ queryKey: ['jobs'] });
 		await client.invalidateQueries({ queryKey: ['scenes'] });
+	}
+
+	/**
+	 * Compile the H3 prompts for every clip that lacks one, before any render is
+	 * queued. On a single GPU the LLM and the video model cannot both hold VRAM,
+	 * so compiling first is what keeps llama.cpp from being asked for a model
+	 * while H3 is loaded. Saved drafts make the following Generate spend zero
+	 * LLM calls.
+	 */
+	async function compileMissingPrompts() {
+		if (compiling || batching || allClipIds.length === 0) return;
+		compiling = true;
+		compileNote = '';
+		try {
+			const data = await jobsApi.batchPrompt(projectId, {
+				clip_ids: allClipIds,
+				only_missing: true,
+				save: true,
+			});
+			const summary = t('queue.compiledPrompts', {
+				compiled: data.compiled,
+				skipped: data.skipped,
+			});
+			if (data.endpoint_dead) {
+				toast.error(t('queue.compileEndpointDead', { summary: summary }));
+			} else if (data.failed > 0) {
+				toast.error(t('queue.compileSomeFailed', { summary: summary, failed: data.failed }));
+			} else if (data.compiled === 0) {
+				toast.success(t('queue.compileNothingMissing', { skipped: data.skipped }));
+			} else {
+				toast.success(summary);
+			}
+			await client.invalidateQueries({ queryKey: ['scenes'] });
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			compiling = false;
+			compileNote = '';
+		}
 	}
 
 	/** Resolve the workflow for a CLIP (issue #66): explicit in-session pick →
@@ -831,6 +841,16 @@ const generateOne = createMutation({
 			>
 				<Icon name="film" size={14} /> {batchLabel}
 			</Button>
+			<Button
+				variant="secondary"
+				disabled={compiling || batching || allClipIds.length === 0}
+				loading={compiling}
+				title={t('queue.compilePromptsTitle')}
+				onclick={compileMissingPrompts}
+			>
+				<Icon name="sparkle" size={14} />
+				{compiling ? compileNote || t('queue.compilingPrompts') : t('queue.compilePrompts')}
+			</Button>
 		{/if}
 		<Button variant="secondary" onclick={togglePause}>
 			{$queueStatusQuery.data?.paused ? t('queue.resumeQueue') : t('queue.pauseQueue')}
@@ -886,20 +906,6 @@ const generateOne = createMutation({
 		{@const selWf = selClip ? workflowForClip(selClip, selected) : undefined}
 		{@const selStatus = selClip ? statusOfClip(selClip.id) : sceneStatus(selected)}
 		{@const selPreview = selClip ? previewPathForClip(selClip.id) : null}
-		{@const selHasVideoInput = workflowHasVideoInput(selWf)}
-		{@const selVideoNode = videoInputNodeFor(selWf)}
-		{@const selClips = timelineClipOptions(selected)}
-		{@const selChain = Boolean(selClip?.chain_from_prev ?? selected.chain_from_prev)}
-		{@const selSource = clipSource[selected.id] ?? 'auto'}
-		{@const selSourceValid = selSource === 'auto' || selSource === 'upload' || selClips.some((o) => o.path === selSource)}
-		{@const selBlocked = selChain && !selHasVideoInput}
-		<input
-			bind:this={videoFileInput}
-			type="file"
-			class="sr-only-video-file"
-			accept="video/*,.mp4,.webm,.mov,.mkv"
-			onchange={onVideoFileChosen}
-		/>
 		<VideoEditWorkspace
 			{scenes}
 			{filmClips}
@@ -926,41 +932,21 @@ const generateOne = createMutation({
 			{formatClock}
 			onApplyToClip={(j, path) => applyJobToClip(j, path)}
 			applying={applyingJob}
-			generateDisabled={selBlocked}
-			generateDisabledReason={selBlocked
-				? t('queue.chainDisabledReason')
-				: ''}
-			clipSource={{
-				enabled: selChain && selHasVideoInput && Boolean(selVideoNode),
-				value: selSourceValid ? selSource : 'auto',
-				options: selClips.map((o) => ({
-					id: o.path,
-					label: o.label,
-					path: o.path,
-				})),
-			}}
-			onClipSourceChange={(val) => {
-				if (val === 'auto') {
-					// Back to Auto: send nothing — the backend resolves the previous clip.
-					const next = { ...clipSource };
-					delete next[selected.id];
-					clipSource = next;
-					if (selVideoNode) formValues = { ...formValues, [selVideoNode.nodeId]: '' };
-				} else if (val === 'upload') {
-					clipSource = { ...clipSource, [selected.id]: 'upload' };
-				} else {
-					clipSource = { ...clipSource, [selected.id]: val };
-					if (selVideoNode) {
-						formValues = { ...formValues, [selVideoNode.nodeId]: val };
-					}
-				}
-			}}
-			onClipSourceUpload={() => videoFileInput?.click()}
+			onChainStartChange={setChainStart}
 			onSelectClip={selectClip}
 			onStep={step}
 		onWorkflowChange={(id) => {
 			if (!selClip) return;
+			const from = workflowForClip(selClip, selected);
 			selectedWorkflow = { ...selectedWorkflow, [selClip.id]: Number(id) };
+			const to = workflowForClip(selClip, selected);
+			if (from?.id === to?.id) return;
+			// nodeIds mean different things in different workflows: keep only values whose
+			// node has the same role and kind in both; the new workflow's defaults fill the rest.
+			formValues = {
+				...(selectedEntry ? seedClipDefaults(selectedEntry) : {}),
+				...carryValuesAcrossWorkflows(formValues, from?.input_schema, to?.input_schema),
+			};
 		}}
 		onGenerate={() => {
 			if (selClip) $generateOne.mutate({ clipId: selClip.id, sceneId: selected.id });
@@ -1129,18 +1115,6 @@ const generateOne = createMutation({
 </div>
 
 <style>
-	.sr-only-video-file {
-		position: absolute;
-		width: 1px;
-		height: 1px;
-		padding: 0;
-		margin: -1px;
-		overflow: hidden;
-		clip: rect(0 0 0 0);
-		white-space: nowrap;
-		border: 0;
-	}
-
 	.queue-root {
 		display: flex;
 		flex-direction: column;

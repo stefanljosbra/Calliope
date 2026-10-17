@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS projects (
     target_duration TEXT,
     cover_path TEXT,
     status TEXT NOT NULL DEFAULT 'draft',
+    continuity_json TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -120,6 +121,7 @@ CREATE TABLE IF NOT EXISTS workflows (
     description TEXT,
     prompt_profile TEXT NOT NULL DEFAULT 'prose',
     is_enabled INTEGER NOT NULL DEFAULT 1,
+    strict_mode INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -318,6 +320,13 @@ async def migrate_db(db_path: Path) -> None:
         conn.execute(
             "ALTER TABLE workflows ADD COLUMN prompt_profile TEXT NOT NULL DEFAULT 'prose'"
         )
+    if "strict_mode" not in cols:
+        # Strict mode is ON by default (and backfilled ON for existing rows):
+        # exposed (Input:*) prompt/reference slots must not inherit the
+        # workflow's baked-in default, so a stray test reference can't leak.
+        conn.execute(
+            "ALTER TABLE workflows ADD COLUMN strict_mode INTEGER NOT NULL DEFAULT 1"
+        )
     scene_cols = {r[1] for r in conn.execute("PRAGMA table_info(scenes)").fetchall()}
     if "location_id" not in scene_cols:
         conn.execute("ALTER TABLE scenes ADD COLUMN location_id INTEGER")
@@ -369,6 +378,47 @@ async def migrate_db(db_path: Path) -> None:
     project_cols = {r[1] for r in conn.execute("PRAGMA table_info(projects)").fetchall()}
     if "cover_path" not in project_cols:
         conn.execute("ALTER TABLE projects ADD COLUMN cover_path TEXT")
+    if "continuity_json" not in project_cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN continuity_json TEXT")
+    # CLI authoring bridge. See docs/plans/2026-10-05-cli-authoring-bridge.md.
+    # Both are additive; no backfill, and neither participates in concurrency
+    # control (the preflight row-hash is the real guard, §3.5 of the plan).
+    if "project_revision" not in project_cols:
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN project_revision INTEGER NOT NULL DEFAULT 0"
+        )
+    if "ingest_mode" not in project_cols:
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN ingest_mode TEXT NOT NULL DEFAULT 'builtin'"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_projects_ingest_mode ON projects(ingest_mode)"
+    )
+    # cli_audit: append-only. Rollback is a NEW row carrying undo_of_entry_id,
+    # never a DELETE — the log must be able to explain itself.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cli_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            actor TEXT NOT NULL,
+            command TEXT NOT NULL,
+            args_json TEXT NOT NULL DEFAULT '{}',
+            changes_json TEXT NOT NULL DEFAULT '[]',
+            base_scope_hash TEXT NOT NULL DEFAULT '',
+            after_scope_hash TEXT NOT NULL DEFAULT '',
+            undo_of_entry_id INTEGER,
+            summary TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cli_audit_project ON cli_audit(project_id, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cli_audit_command ON cli_audit(command, id)"
+    )
     # Legacy canvases carry generic titles ("Untitled Canvas" or an older
     # iteration's "Project canvas"); name them after what they show
     # (project, else session). New canvases derive at create time.
@@ -394,17 +444,16 @@ def ensure_default_clip(conn: sqlite3.Connection, scene_id: int, project_id: int
     """Every scene keeps >= 1 clip: inserts default clip #1 when none exist.
 
     The default inherits the scene's production fields (duration, workflow,
-    settings, chain) so an un-expanded project behaves exactly like the old
-    1:1 model. Called by every scene-creation path (router CRUD, script
+    settings) so an un-expanded project behaves exactly like the old 1:1
+    model. Called by every scene-creation path (router CRUD, script
     generation, coverage expansion replacement).
     """
     conn.execute(
         """
         INSERT INTO clips (scene_id, project_id, order_index, description,
-                           duration_sec, workflow_id, clip_path, video_settings_json,
-                           chain_from_prev)
+                           duration_sec, workflow_id, clip_path, video_settings_json)
         SELECT ?, ?, 1, NULL, duration_sec, workflow_id, video_path,
-               video_settings_json, chain_from_prev
+               video_settings_json
         FROM scenes s
         WHERE s.id = ? AND s.project_id = ?
           AND NOT EXISTS (SELECT 1 FROM clips WHERE scene_id = ?)

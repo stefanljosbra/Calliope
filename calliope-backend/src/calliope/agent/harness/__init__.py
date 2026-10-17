@@ -35,11 +35,19 @@ logger = logging.getLogger("calliope.harness")
 # human guidance text stays in the deny message for the model).
 GUARD_RENDER_APPROVAL = "guard_render_approval"
 GUARD_DESTRUCTIVE_REPLACE = "guard_destructive_replace"
+# Agent shell (run_command) denials — defined here so the contracts exporter
+# (which scans this module + registry.py) picks them up.
+GUARD_SHELL_DISABLED = "guard_shell_disabled"
+GUARD_SHELL_APPROVAL = "guard_shell_approval"
+GUARD_SHELL_OUTSIDE_WORKSPACE = "guard_shell_outside_workspace"
+GUARD_SHELL_DENIED_PATH = "guard_shell_denied_path"
+GUARD_SHELL_DENIED_COMMAND = "guard_shell_denied_command"
 # Scene tool scope guard lives in registry.py (circular-import free); the
 # contracts exporter reads guard codes from THIS module, so re-export here.
 from calliope.agent.harness.registry import (  # noqa: E402
     GUARD_SCENE_TOOL_SCOPE,
     GUARD_NO_EXPORT_VIDEO_TOOL,
+    GUARD_WORKSPACE_PATH,
     EXPORT_VIDEO_DENIED_NAMES,
     _scene_scoped,
 )
@@ -178,6 +186,7 @@ def build_harness() -> tuple[ToolRegistry, SystemPromptService]:
     _load_plugins()
     from calliope.agent.harness.plugins import (  # noqa: E402
         canvas,
+        files,
         interaction,
         memory,
         render,
@@ -185,6 +194,7 @@ def build_harness() -> tuple[ToolRegistry, SystemPromptService]:
         shot_builder,
         skills,
         story,
+        system,
         workspace,
     )
 
@@ -197,6 +207,8 @@ def build_harness() -> tuple[ToolRegistry, SystemPromptService]:
     memory.register(registry)
     skills.register(registry)
     shot_builder.register(registry)
+    system.register(registry)
+    files.register(registry)
     registry.on_pre_execute(_destructive_guard)
     registry.on_pre_execute(_render_approval_guard)
     register_builtin_sections(prompts)

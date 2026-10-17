@@ -204,6 +204,30 @@ def register(registry: ToolRegistry) -> None:
     )
     registry.register(
         ToolDefinition(
+            name="refresh_continuity_plan",
+            description=(
+                "Write or refresh the project's continuity ledger: one timed "
+                "plan for every clip (style, speaker bindings, camera, lighting, "
+                "what changes after each shot). Call this after generate_script "
+                "or break_into_shots, before rendering, so later clip prompts "
+                "are slices of the same film. force=true rewrites even when the "
+                "board hash still matches."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "force": {
+                        "type": "boolean",
+                        "description": "Rewrite the plan even if the board hash matches (default true)",
+                    },
+                },
+            },
+            executor=t_refresh_continuity_plan,
+            category="script",
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="add_clip",
             description=(
                 "Add one shot clip to a scene's end (or order_index within it). "
@@ -232,7 +256,6 @@ def register(registry: ToolRegistry) -> None:
                     },
                     "duration_sec": {"type": "number"},
                     "workflow_id": {"type": "integer"},
-                    "chain_from_prev": {"type": "boolean"},
                 },
             },
             executor=t_add_clip,
@@ -244,7 +267,7 @@ def register(registry: ToolRegistry) -> None:
             name="update_clip",
             description=(
                 "Edit one clip (description / shot_size / dialog_lines_covered / "
-                "duration_sec / workflow_id / chain_from_prev). Address it by "
+                "duration_sec / workflow_id). Address it by "
                 "clip_id (from list_clips) or ref '#3.2'."
             ),
             parameters={
@@ -263,7 +286,6 @@ def register(registry: ToolRegistry) -> None:
                     },
                     "duration_sec": {"type": "number"},
                     "workflow_id": {"type": "integer"},
-                    "chain_from_prev": {"type": "boolean"},
                 },
             },
             executor=t_update_clip,
@@ -814,6 +836,22 @@ async def t_break_into_shots(ctx: ToolContext, args: dict[str, Any]) -> dict[str
     }
 
 
+async def t_refresh_continuity_plan(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite the project continuity ledger from the current board."""
+    from calliope.agent.continuity import ensure_continuity_plan
+
+    if not ctx.project_id:
+        return {"ok": False, "error": "Link a project before refreshing the continuity plan"}
+    force = bool(args.get("force", True))
+    plan = await ensure_continuity_plan(int(ctx.project_id), force=force)
+    return {
+        "ok": True,
+        "based_on": plan.get("based_on") or "",
+        "shots": len(plan.get("shots") or []),
+        "refreshed": bool(plan.get("refreshed")),
+    }
+
+
 async def t_add_clip(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     conn = _db()
     try:
@@ -835,8 +873,8 @@ async def t_add_clip(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO clips (scene_id, project_id, order_index, description,
                                shot_size, dialog_lines_covered, duration_sec,
-                               workflow_id, chain_from_prev)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               workflow_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scene_id,
@@ -847,7 +885,6 @@ async def t_add_clip(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
                 covered_json,
                 args.get("duration_sec"),
                 args.get("workflow_id"),
-                1 if args.get("chain_from_prev") else 0,
             ),
         )
         conn.execute(
@@ -872,7 +909,7 @@ async def t_update_clip(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
         )
         if err:
             return {"ok": False, "error": err}
-        cols = ("description", "shot_size", "duration_sec", "workflow_id", "chain_from_prev")
+        cols = ("description", "shot_size", "duration_sec", "workflow_id")
         data = {k: v for k, v in args.items() if k in cols and v is not None}
         if "dialog_lines_covered" in args and args["dialog_lines_covered"] is not None:
             data["dialog_lines_covered"] = json.dumps(

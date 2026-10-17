@@ -1,5 +1,14 @@
-export type ComfyInputKind = 'text' | 'textarea' | 'number' | 'image' | 'image_url' | 'audio' | 'video';
-export type ComfyOutputKind = 'image' | 'video' | 'other';
+export type ComfyInputKind =
+	| 'text'
+	| 'textarea'
+	| 'number'
+	| 'boolean'
+	| 'image'
+	| 'image_url'
+	| 'audio'
+	| 'video'
+	| 'latent';
+export type ComfyOutputKind = 'image' | 'video' | 'latent' | 'other';
 
 export interface ComfyDynamicInput {
 	nodeId: string;
@@ -7,7 +16,7 @@ export interface ComfyDynamicInput {
 	/** Role from title tag, e.g. (Input:prompt) → "prompt". Null for plain (Input). */
 	role?: string | null;
 	kind: ComfyInputKind;
-	defaultValue?: string | number;
+	defaultValue?: string | number | boolean;
 	required: boolean;
 }
 
@@ -35,6 +44,7 @@ export interface Workflow {
 	description: string | null;
 	prompt_profile: string;
 	is_enabled: boolean;
+	strict_mode: boolean;
 }
 
 export interface Job {
@@ -56,12 +66,17 @@ export interface Job {
 }
 
 export interface SceneVideoSettings {
-	input_values?: Record<string, string | number>;
-	/** 'auto' | 'upload' | target scene id as string. */
-	clip_source?: string;
+	input_values?: Record<string, string | number | boolean>;
 	form_workflow_id?: number;
 	prompt_draft?: string;
 	prompt_draft_meta?: { based_on?: string; saved_at?: string };
+	/** H3 motion-context chains: user-owned "Start a new chain here". */
+	chain_start?: boolean;
+	/** Worker-owned chain facts for the clip's current render (read-only here). */
+	latent_path?: string | null;
+	latent_job_id?: number | null;
+	continued_from_clip_id?: number | null;
+	continued_from_job_id?: number | null;
 	[key: string]: unknown;
 }
 
@@ -77,7 +92,6 @@ export interface Scene {
 	env_image_path: string | null;
 	location_id: number | null;
 	video_path: string | null;
-	chain_from_prev?: number | boolean | null;
 	video_settings?: SceneVideoSettings | null;
 	character_ids: number[];
 	characters: Array<{
@@ -102,7 +116,6 @@ export interface Clip {
 	duration_sec: number | null;
 	workflow_id: number | null;
 	clip_path: string | null;
-	chain_from_prev?: number | boolean | null;
 	video_settings?: SceneVideoSettings | null;
 	/** '#3.2' — scene 3, clip 2 (display label). */
 	label?: string;

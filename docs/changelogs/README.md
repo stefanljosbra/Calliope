@@ -2,6 +2,10 @@
 
 Dated notes for GitHub releases. Newest first.
 
+- [2026-10-16 H3 latent continuation](./2026-10-16-h3-latent-continuation.md) — a clip can continue the previous clip's motion and sound when the workflow has H3 motion-context Load/Save latent nodes; hard cut on those joins; other workflows unchanged; PR #97 (1.6.0)
+- [2026-10-06 CLI authoring bridge](./2026-10-06-cli-authoring-bridge.md) — `calliope-cli`: write beats, cast, scenes, clips, and continuity from OpenCode or Cursor; long novels stay out of the in-app generator; hash guard, audit log, no delete / no model / no images-or-video; PR #92 (1.6.0)
+- [2026-10-05 deterministic prompts + agent workspace + vision speed](./2026-10-05-deterministic-prompts-workspace-vision.md) — H3 prompts compile instantly (LLM only on Regenerate); your typed prompt wins verbatim; chain/continue + Video source picker removed (video input is workflow-owned); per-session agent scratch file tools for main + sub-agents; 4K vision images resized + cached; sub-agent reasoning streams live; includes PR #83 (1.5.9)
+- [2026-09-27 story continuity plans](./2026-09-27-story-continuity.md) — one film plan per project shared by the Video tab and project-linked AI Canvas; H3 compiles a clip from that slice; the prompt modal shows continuity notes and Generate stays available (1.5.8)
 - [2026-09-24 clip workflow + runtime budget](./2026-09-24-clip-workflow-runtime-budget.md) — workflow per clip (not per scene); target runtime is a budget that can shrink; media inputs that are directories fail fast with a node-naming error; attachment turns no longer crash the orchestrator, `ask_user` closes its tool batch (1.5.7)
 - [2026-09-22 project name alias patch](./2026-09-22-project-name-alias.md) — `name` accepted for a project's title on the REST API and agent tools; fixes storyline builds dead-ending on a 422 (1.5.6)
 - [2026-09-22 swarm render/scene fixes](./2026-09-22-swarm-render-scene-fixes.md) — video-role render tools reachable (ask_user recovery); story role gains scene tools; deep-link sessions no longer orphan; canvas auto-seeds new entities (1.5.5)

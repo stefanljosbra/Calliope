@@ -135,59 +135,99 @@ class ComfyUIClient:
                 "picker or attach it in chat, then retry."
             )
 
+    @staticmethod
+    def _references_node(workflow: dict[str, Any], node_id: str) -> bool:
+        """True when any other node consumes this node's output.
+
+        In ComfyUI API format a link is ``[node_id, output_index]``; a node whose
+        output nothing consumes is pruned by ComfyUI and never executed, so a bad
+        value there is harmless.
+        """
+        target = str(node_id)
+
+        def links_to(value: Any) -> bool:
+            if isinstance(value, list):
+                if (
+                    len(value) >= 2
+                    and isinstance(value[0], str)
+                    and value[0] == target
+                    and isinstance(value[1], int)
+                ):
+                    return True
+                return any(links_to(item) for item in value)
+            if isinstance(value, dict):
+                return any(links_to(item) for item in value.values())
+            return False
+
+        return any(
+            links_to(node.get("inputs"))
+            for nid, node in workflow.items()
+            if str(nid) != target and isinstance(node, dict)
+        )
+
+    @staticmethod
+    def _reject_empty_media(
+        node_id: str, class_type: str, field: str, node: dict[str, Any]
+    ) -> None:
+        """Fail a job BEFORE queueing when a wired-in media input has no value.
+
+        ComfyUI's LoadVideo/LoadImage/LoadAudio resolve an empty name to the
+        ``input`` directory (or a missing file) and die deep inside the node with
+        an opaque av/Errno error. Catching it here keeps the failure actionable
+        and stays workflow-agnostic: any workflow whose media node is consumed
+        but left blank is reported by node and title.
+        """
+        title = (node.get("_meta") or {}).get("title") or class_type
+        raise RuntimeError(
+            f"node {node_id} ({class_type} \"{title}\"): '{field}' is empty but this "
+            "workflow consumes it. Provide a reference file, mark the clip as "
+            "continue-from-previous, or pick a workflow without this input."
+        )
+
     async def prepare_media_inputs(self, workflow: dict[str, Any]) -> dict[str, Any]:
-        """Upload local file paths referenced in LoadImage / LoadAudio / LoadVideo nodes."""
+        """Upload local file paths referenced in LoadImage / LoadAudio / LoadVideo nodes.
+
+        Also rejects a wired-in media node whose value is blank (#67 follow-up: an
+        empty LoadVideo resolved to the input directory and crashed
+        GetVideoComponents with ``av.error.PermissionError``). Unreferenced blank
+        nodes are left alone — ComfyUI prunes them.
+        """
         for node_id, node in workflow.items():
             if not isinstance(node, dict):
                 continue
             class_type = node.get("class_type", "")
             inputs = node.get("inputs") or {}
             if class_type in IMAGE_CLASSES:
-                image = inputs.get("image")
-                if isinstance(image, str) and self._looks_like_local_path(image):
-                    path = Path(image)
-                    if path.exists():
-                        if path.is_dir():
-                            self._reject_bad_media_path(image, str(node_id), class_type, "image")
-                        inputs["image"] = await self.upload_image(path)
-                        node["inputs"] = inputs
-                    else:
-                        self._reject_bad_media_path(image, str(node_id), class_type, "image")
+                field = "image"
             elif class_type in AUDIO_CLASSES:
                 # VHS_LoadAudio names its widget "audio:" (with colon); stock
-                # LoadAudio uses "audio". Probe both so the file is uploaded
-                # whichever variant the workflow uses.
-                audio_key = next(
-                    (k for k in ("audio", "audio:") if isinstance(inputs.get(k), str)),
-                    None,
-                )
-                if audio_key:
-                    audio = inputs[audio_key]
-                    if isinstance(audio, str) and self._looks_like_local_path(audio):
-                        path = Path(audio)
-                        if path.exists():
-                            if path.is_dir():
-                                self._reject_bad_media_path(
-                                    audio, str(node_id), class_type, audio_key
-                                )
-                            inputs[audio_key] = await self.upload_audio(path)
-                            node["inputs"] = inputs
-                        else:
-                            self._reject_bad_media_path(
-                                audio, str(node_id), class_type, audio_key
-                            )
+                # LoadAudio uses "audio". Probe both so the file reaches the
+                # right widget whichever variant the workflow uses.
+                field = next((k for k in ("audio", "audio:") if k in inputs), "audio")
             elif class_type in VIDEO_CLASSES:
                 field = "file" if class_type in VIDEO_FILE_CLASSES else "video"
-                media = inputs.get(field)
-                if isinstance(media, str) and self._looks_like_local_path(media):
-                    path = Path(media)
-                    if path.exists():
-                        if path.is_dir():
-                            self._reject_bad_media_path(media, str(node_id), class_type, field)
-                        inputs[field] = await self.upload_video(path)
-                        node["inputs"] = inputs
-                    else:
-                        self._reject_bad_media_path(media, str(node_id), class_type, field)
+            else:
+                continue
+
+            media = inputs.get(field)
+            if not isinstance(media, str):
+                continue
+            if not media.strip():
+                if self._references_node(workflow, str(node_id)):
+                    self._reject_empty_media(str(node_id), class_type, field, node)
+                continue
+            if not self._looks_like_local_path(media):
+                # Bare/relative names are legitimate Comfy-side references.
+                continue
+            path = Path(media)
+            self._reject_bad_media_path(media, str(node_id), class_type, field)
+            if class_type in AUDIO_CLASSES:
+                inputs[field] = await self.upload_audio(path)
+            elif class_type in VIDEO_CLASSES:
+                inputs[field] = await self.upload_video(path)
+            else:
+                inputs[field] = await self.upload_image(path)
+            node["inputs"] = inputs
         return workflow
 
     @staticmethod
@@ -237,15 +277,107 @@ class ComfyUIClient:
             logger.warning("ComfyUI interrupt failed: %s", exc)
 
     def extract_outputs(self, history: dict[str, Any]) -> list[dict[str, str]]:
+        """Every file in a run's history, tagged with its history ``key``.
+
+        ``latents`` (H3 motion-context Save Latent) are collected too; the key
+        keeps them out of select_output_files' media result.
+        """
         outputs: list[dict[str, str]] = []
-        for _node_id, node_out in (history.get("outputs") or {}).items():
-            for key in ("images", "gifs", "videos"):
+        for node_id, node_out in (history.get("outputs") or {}).items():
+            for key in ("images", "gifs", "videos", "latents"):
                 for item in node_out.get(key) or []:
                     outputs.append(
                         {
                             "filename": item.get("filename", ""),
                             "subfolder": item.get("subfolder", ""),
                             "type": item.get("type", "output"),
+                            "node_id": str(node_id),
+                            "key": key,
                         }
                     )
         return outputs
+
+    async def upload_latent(self, path: Path, name: str) -> str:
+        """Upload a saved AV latent into ComfyUI's flat input folder as ``name``.
+
+        Same ``/upload/image`` route as audio/video (it accepts any file);
+        overwrite so a re-rendered previous clip replaces its old upload.
+        """
+        data = path.read_bytes()
+        files = {"image": (name, data, "application/octet-stream")}
+        form = {"overwrite": "true", "type": "input"}
+        resp = await self._http.post(f"{self.base_url}/upload/image", files=files, data=form)
+        if resp.status_code >= 400:
+            raise _surface_error("ComfyUI latent upload failed", resp)
+        result = resp.json()
+        uploaded = result.get("name", name)
+        sub = result.get("subfolder") or ""
+        return f"{sub}/{uploaded}" if sub else uploaded
+
+    async def latent_input_supported(self) -> bool:
+        """True when the installed Load Latent can read from the input folder.
+
+        ComfyUI-H3-Motion-Context releases before the ``folder`` widget would
+        look for the uploaded file under output/ and fail with a path error.
+        """
+        resp = await self._http.get(
+            f"{self.base_url}/object_info/MiniMaxH3MotionContextLoadLatent"
+        )
+        if resp.status_code >= 400:
+            return False
+        info = (resp.json() or {}).get("MiniMaxH3MotionContextLoadLatent") or {}
+        folder = ((info.get("input") or {}).get("optional") or {}).get("folder")
+        choices = folder[0] if isinstance(folder, list) and folder else []
+        return isinstance(choices, list) and "input" in choices
+
+
+# Input loaders publish the source file into ComfyUI history (VHS_LoadVideo's
+# preview gif). That file is not the generated clip.
+_LOADER_OUTPUT_CLASSES = frozenset(
+    {
+        "LoadVideo",
+        "VHS_LoadVideo",
+        "VHS_LoadVideoPath",
+        "LoadImage",
+        "ImageLoader",
+        "ETN_LoadImageBase64",
+        "LoadAudio",
+        "VHS_LoadAudio",
+    }
+)
+
+
+def select_output_files(
+    files: list[dict[str, str]],
+    nodes: dict[str, Any],
+    kind: str,
+) -> list[dict[str, str]]:
+    """Files that belong to this job, not a loader's echo of the input.
+
+    Prefer nodes tagged ``(Output:video)`` / ``(Output:image)``. When nothing
+    is tagged, drop loader-class results and keep the rest. A workflow whose
+    only history file is a save node is unchanged.
+    """
+    from calliope.comfyui.parser import parse_dynamic_outputs
+
+    # Saved latents are chain state, collected separately — never the clip.
+    files = [item for item in files if item.get("key") != "latents"]
+    role = "video" if kind == "video" else "image" if kind == "image" else None
+    if role:
+        tagged = {
+            str(item["nodeId"])
+            for item in parse_dynamic_outputs(nodes)
+            if item.get("role") == role or item.get("kind") == role
+        }
+        chosen = [item for item in files if item.get("node_id") in tagged]
+        if chosen:
+            return chosen
+
+    loaders = {
+        str(node_id)
+        for node_id, node in nodes.items()
+        if isinstance(node, dict) and node.get("class_type") in _LOADER_OUTPUT_CLASSES
+    }
+    if not loaders:
+        return files
+    return [item for item in files if item.get("node_id") not in loaders]

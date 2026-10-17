@@ -12,6 +12,9 @@ Calliope is a local-first story-to-video studio. You type a story idea; Calliope
 <img width="1976" height="1154" alt="Screenshot 2026-09-13 025721" src="https://github.com/user-attachments/assets/b58fcecf-b6be-41ac-91d8-9f0df2fd8f21" />
 
 
+## Demo
+
+From Script to Video Locally Using Calliope 1.5 https://youtu.be/JcGqt3DYn6c
 
 ## Install — from source (npm + Python)
 
@@ -69,6 +72,11 @@ In **Settings → Agent**:
 
 - **Model per agent** — assign any saved LLM to each role: **Main agent, Planner, Story agent, Script agent, Assets agent, Video agent**. Blank means the **Active LLM** from Settings → LLM applies, so a single-endpoint setup needs no configuration here. A common setup is a strong cloud model for the main agent and planner, and a fast local model for the sub-agents. The Video agent's assignment also drives the MiniMax H3 prompt rewrite.
 - **System-prompt rules (hardening)** — operator rules appended to every agent system prompt. Leave blank to disable.
+- **Agent shell (`run_command`)** — off by default. When enabled, the agent may run simple commands (ffprobe, scripts you approve) inside the sandbox described below; anything non-read-only asks you first via a confirmation card.
+
+### Agent workspace
+
+**Settings → System Paths → Agent workspace** (default `DATA_DIR/workspace`) is a scratch folder on disk the AI agent may work in. Every chat session gets its own subfolder (`workspace/sessions/<session id>`), shared between the main agent and its sub-agents. The agent uses four file tools — `list_files`, `read_file`, `write_file`, `delete_file` — to draft scripts, beat lists, shot plans, and video prompts as text files while it works, show you the drafts, and then commit the approved content into the project (scenes, clips, beats) with its normal editing tools. The files are the working medium; the database stays the store. Paths cannot escape the session folder, sensitive files (config, database, keys) are denied by name, and the optional shell, when enabled, is sandboxed to the same workspace.
 
 ## Using the app
 
@@ -77,8 +85,8 @@ The app walks a project through four stages — **Story, Assets, Script, Video**
 - **Story:** describe your idea and **Draft Storyline** — this opens a project-linked chat in the Agents view with the prompt pre-filled, and the agent writes beats, characters, locations, and misc. items. Edit anything by hand before moving on.
 - **Assets:** each character, location, and item has its own **Image prompt**. Pick a workflow and shared settings (width/height/etc.) at the top, then click Generate per entity to produce reference images on your ComfyUI. Regenerate any single entity without touching the others.
 - **Script:** **Regenerate Script** also opens a project-linked Agents chat (pre-filled) to rewrite the per-scene script. Scenes preserve the full screenplay: complete action prose and verbatim dialogue. Then **Break into shots** splits a scene into its shot clips — an LLM coverage pass allocates every dialogue line and action beat across clips of ~5–10 seconds (a 2-minute dialogue scene becomes a dozen clips, not one). Scenes link back to the characters and locations from the Story stage.
-- **Video:** each clip gets rendered by a **Generate** pass that queues a job on ComfyUI with the right prompt and reference images (plus optional video/audio file refs). Clips marked **Continue from previous clip** extend the previous clip instead of cutting fresh — see [Continue from previous clip (video extend)](#continue-from-previous-clip-video-extend).
-- **Film view:** once clips are rendered, **Export film** stitches them with ffmpeg: clips are normalized to 1080p at the **majority frame rate of the clips themselves** (24 fps clips export at 24 fps; mixed-rate projects conform to whichever rate most clips use), joined with 0.5s crossfades, and loudness-normalized into one final file.
+- **Video:** each clip gets rendered by a **Generate** pass that queues a job on ComfyUI with the right prompt and reference images (plus optional video/audio file refs, if the workflow declares an `(Input:video)` node — see [Video inputs are workflow-owned](#video-inputs-are-workflow-owned-no-auto-chaining)).
+- **Film view:** once clips are rendered, **Export film** stitches them with ffmpeg: clips are normalized to 1080p at the **majority frame rate of the clips themselves** (24 fps clips export at 24 fps; mixed-rate projects conform to whichever rate most clips use), joined with 0.5s crossfades (a hard cut where a clip continues the one before it through H3 motion context — see [Continuing a clip](#continuing-a-clip-h3-motion-context)), and loudness-normalized into one final file.
 - When everything is done the project is automatically marked **Completed**.
 
 **Playground** is a free-form generation page outside the project pipeline: run any imported workflow with arbitrary inputs, upload your own files (image / video / audio) as inputs, and optionally attach a result to a project as an asset.
@@ -130,6 +138,7 @@ Input roles:
 | `audio` | `sound`, `sfx` | Audio file input (`LoadAudio`) |
 | `seed` | — | Shared form |
 | `duration` | `dur`, `length`, `seconds` | Scene duration (video jobs) |
+| `latent` | — | Previous clip's saved latent (H3 motion context; filled by Calliope) |
 
 Output roles:
 
@@ -137,49 +146,52 @@ Output roles:
 |---|---|
 | `image` | `img` |
 | `video` | `vid` |
+| `latent` | — |
 
 Unknown roles still show up in the dynamic form; they just get no special auto-fill. Plain `(Input)` / `(Output)` without a role still works through a deprecated label fallback, so old workflows keep working — but tag new workflows with explicit roles.
 
 #### Prompt profiles
 
-Each workflow has a **Prompt format** setting (default *Plain prose*). When set to *MiniMax H3 reference (6-section)*, Calliope rewrites each scene prompt at generation time into MiniMax H3's full-reference format (`subject_definitions` → `summary` → `retention_analysis` → `detailed_description` → `overall_soundscape` → `non_diegetic_music`, with `<Subject N>` labels and `<d>[Language] …</d>` dialogue). It is auto-suggested on import when the workflow contains a `MiniMaxH3*` node.
+Each workflow has a **Prompt format** setting (default *Plain prose*). When set to *MiniMax H3 reference (6-section)*, Calliope compiles each scene prompt into MiniMax H3's full-reference format (`subject_definitions` → `summary` → `retention_analysis` → `detailed_description` → `overall_soundscape` → `non_diegetic_music`, with `<Subject N>` labels and `<d>[Language] …</d>` dialogue). The compile is **instant and deterministic** — no LLM wait; the optional LLM rewrite runs only when you press **Regenerate** in the prompt preview. It is auto-suggested on import when the workflow contains a `MiniMaxH3*` node.
 
 For multi-reference workflows, generic `(Input:image)` inputs are filled in **node-id order** — characters in scene order, then the location — and that order defines the `<Subject N>` numbering in the prompt. Keep your ref node ids in the order you want subjects numbered. A `(Input:duration)` node receives the scene's duration in seconds.
 
 **Using the H3 profile from the scene form (Generate clip):** the form's auto-fill vs. override rule is simple — anything you type or pick wins over the automatic value.
 
-- **Text Prompt — leave it empty.** An empty field gets the LLM-rewritten six-section H3 prompt built from the scene's action, dialogue, characters, and location. If you type anything, your text is sent verbatim and the model receives plain prose instead of the H3 format.
+- **Text Prompt — leave it empty.** An empty field gets the deterministic six-section H3 prompt built from the scene's action, dialogue, characters, and location. If you type anything, your text is sent verbatim — the compile never replaces it (so you can write directives like `<video 1> — extend and continue:` yourself).
 - **Ref 1 / Ref 2 — leave them on "Choose asset…"** to auto-fill from the scene's characters (in scene order) then the location, with `<Subject N>` numbering matched to those slots. Picking an asset manually overrides just that slot (and you take over subject numbering for it).
 - **Duration** auto-fills from the scene's estimated duration; edit it only when you want a different clip length.
 
-### Continue from previous clip (video extend)
+### Video inputs are workflow-owned (no auto-chaining)
 
-Long takes don't have to be one giant generation. Mark a clip **Continue from previous clip** in the **Script** stage (the toggle lives on a scene when it hasn't been expanded — expanding migrates it onto the clip) and instead of cutting a fresh clip, it extends the previous clip in the timeline as real continuation footage (the first clip can't use the toggle).
-
-The **Video** stage enforces one requirement: the workflow must have an input tagged `(Input:video)` (a `LoadVideo` node). Continue clips on a workflow without one have Generate disabled with a warning.
-
-When the workflow qualifies, a **clip source picker** appears on the continue scene:
-
-- **Auto** (default) — the previous clip in timeline order is used, resolved when the job actually runs.
-- **Upload file** — extend from any video you provide (a Playground upload).
-- **From timeline** — pick a specific earlier clip explicitly.
-
-Auto is safe even when clips are queued in one batch: Calliope's queue renders one job at a time, so by the time a continue clip runs, the clip before it has already rendered and is picked up automatically.
+Whether a render consumes a reference video is decided **entirely by the ComfyUI workflow** — a node tagged `(Input:video)` (a `LoadVideo` node). Calliope adds no per-scene "chain" flag and no clip-source picker: if your workflow has a video input, it appears in the Video-stage form like any other media slot, and you supply the video yourself — upload a file, or pick a rendered clip from the project via the asset picker. Leave it empty and the job fails in ComfyUI with its own error; Calliope never silently invents an input for you. (The one input Calliope does fill on its own is an H3 motion-context **latent** slot, which is also declared by the workflow — see [Continuing a clip](#continuing-a-clip-h3-motion-context).)
 
 The workflow pattern (per [kat3ri/ComfyUI-MiniMax-H3-Extend](https://github.com/kat3ri/ComfyUI-MiniMax-H3-Extend)) is a `LoadVideo (Input:video)` node feeding the MiniMax H3 extend patched nodes (`MiniMaxH3EncodeAVPatched` → `MiniMaxH3VideoExtendPatched`) with the `(Output:video)` node at the end. Recommended starting settings from that repo: `context_frames` **2**, `ref_spacing` **1–2**, `ref_decay` **0.3**, `ref_ramp` **3–4** (5–6 if the prior clip had heavy motion).
 
+### Continuing a clip (H3 motion context)
+
+With [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) installed (a version whose Load Latent has the `folder` widget), a clip can **continue the clip before it**: the previous clip's saved AV latent is pinned at the head of the new one, so motion and sound carry across the join instead of restarting. The example `example_ComfyUI_workflows/MiniMaxH3-Singularity-Continuity-5Ref1Latent-API.json` is wired for it.
+
+- **Tags.** Title the pack's Load Latent node `(Input:latent)` and its Save Latent node `(Output:latent)`. Calliope recognizes both classes even untagged; neither shows a picker in the form — Calliope fills them.
+- **What happens on Generate.** The Save node is pointed at a fixed slot (`calliope/p<project>_c<clip>`), and after the render Calliope downloads that latent over `/view` into `assets/<project>/latent/`. When the next clip renders, Calliope uploads the previous clip's latent over `/upload/image` and the Load node reads it from ComfyUI's input folder. Calliope still never reads or writes ComfyUI's folders directly, and a cleared ComfyUI output folder doesn't break a chain.
+- **Which clip it continues.** The one immediately before it in playback order (scene order, then clip order), across scene boundaries. The first clip always starts a chain; any other clip continues unless you tick **Start a new chain here** on it (shown only for workflows with a latent slot). **Generate all** works in order: a clip whose previous clip is still queued waits for it. A clip whose previous clip has no saved latent fails with a message naming both clips.
+- **Stale continuations.** Re-rendering a clip leaves the clips that continued it as they were and flags them as stale; re-render them to match. Picking an older render from a clip's render history brings that render's latent with it.
+- **Joins in the film.** Export uses a hard cut (no crossfade) on every join where the second clip continues the first, and the usual 0.5 s crossfade everywhere else.
+- **Resolution** must match between the two clips of a join; the pack refuses a mismatch and the job shows its error.
+- Turn Spectrum (`SpectrumApplyMiniMaxH3`) off in continuation workflows, as the Motion Context README advises for pinned frames. The `h3-continuation-prompt` agent skill has the prompt rules that keep a continuation from restarting.
+
 ### Review the prompt before you generate
 
-Generate no longer fires blind. Hitting **Generate** first opens a prompt preview: the exact text that will land on the workflow's `(Input:prompt)` node — your saved draft if there is one, otherwise a fresh MiniMax H3 rewrite (six-section format) or the prose clip prompt (scene heading, the clip's shot description, and only the dialogue lines that clip performs).
+Generate no longer fires blind. Hitting **Generate** first opens a prompt preview: the exact text that will land on the workflow's `(Input:prompt)` node — your typed form text or saved draft if there is one, otherwise the instant MiniMax H3 six-section compile (or the prose clip prompt: scene heading, the clip's shot description, and only the dialogue lines that clip performs). Resolving is instant; the LLM is never in the default path.
 
 - **Edit it inline** — typos, camera notes, pacing, anything. The edited text is what gets sent.
-- **Regenerate** re-runs the H3 rewrite for a different take.
-- **Save draft** keeps it on the clip; future generates (single or **Generate all**) reuse the draft instead of calling the LLM again. A hint appears when the draft predates changes to the scene or clip.
+- **Regenerate** explicitly asks the LLM for a fresh six-section rewrite (this is the only path that waits on a model — and it can also ground on the project's continuity ledger).
+- **Save draft** keeps it on the clip; future generates (single or **Generate all**) reuse the draft. A hint appears when the draft predates changes to the scene or clip.
 - **Cancel** aborts with nothing enqueued.
 
 After a render, **View prompt & inputs** opens the scene's render history: every job as a chip, the payload each one actually sent to ComfyUI, and **Copy settings to form** to pull a past job's input values back into the live form.
 
-Your video-stage setup (workflow choice, input values, clip source) auto-saves and comes back after a reload or app restart. **Generate all** honors every saved setup and draft — the toast reports how many drafts were used.
+Your video-stage setup (workflow choice, input values) auto-saves and comes back after a reload or app restart. **Generate all** honors every saved setup and draft — the toast reports how many drafts were used.
 
 ### Better ComfyUI errors
 
@@ -206,6 +218,49 @@ If ComfyUI "doesn't know what to generate" or jobs come back empty:
 
 Calliope talks to ComfyUI purely over its HTTP API: it uploads reference files with `POST /upload/image`, patches the workflow JSON and queues it via `POST /prompt`, polls `/history/{prompt_id}`, and downloads the results. It **never reads or writes ComfyUI's local `input/` / `output/` folders** — any folder paths stay configured on the ComfyUI side, not in Calliope.
 
+## `calliope-cli` — writing project content from a tool
+
+The web UI is the only way to run renders, and it stays that way. But writing
+**text** — beats, cast, scenes, shot clips, continuity requirements — does not
+need a browser, and a 34k-character novel is a bad fit for a textarea. So there
+is a second door in, for scripts and AI agents:
+
+```bat
+calliope-cli.bat project create --title "灯笼" --idea-file novel.txt --json
+calliope-cli.bat plan next --project 7 --json
+```
+
+32 commands across 10 groups (`project` `story` `cast` `script` `clips`
+`context` `shots` `plan` `log` `schema`). Run `calliope-cli.bat --help`, or
+`schema show story append` for the exact payload shape of any write.
+
+Three things it will not do, with no flag to change that:
+
+- **Never delete.** No `delete` verb exists; the web UI is the only path that
+  removes a project, and it also removes that project's audit log.
+- **Never call a model.** It writes text you give it. It does not summarise,
+  expand, or "improve" anything.
+- **Never touch images or video.** Those columns are read-only.
+
+Because you edit in the UI while a tool works, every write takes
+`--expect-hash` and compares it **inside** the write transaction:
+
+```bat
+calliope-cli.bat project hash --project 7 --json
+calliope-cli.bat story append --project 7 --file beats.json --expect-hash 4f2a9c1e8b7d6053
+```
+
+Refusing because the content moved is **exit 3**, distinct from exit 2 (your
+payload is wrong) — re-read and re-apply rather than retrying the same file.
+Every write is recorded in `cli_audit` with per-row before-images, readable via
+`log list` / `log show`.
+
+An opencode skill lives at `calliope-backend/skills_opencode/calliope/SKILL.md`.
+
+Multi-line text **must** go through `--idea-file` (or `--file -` for stdin).
+`cmd.exe` terminates a command line at a raw newline, so the argument after it is
+silently dropped and the command still exits 0.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE) 
@@ -214,7 +269,11 @@ This project is licensed under the [MIT License](LICENSE)
 
 ```text
 calliope-backend/            FastAPI backend (Python)
+  src/calliope/authoring/    the only place SQL lives; shared with the web UI
+  src/calliope/cli/          calliope-cli — no SQL, no shell, no model calls
+  skills_opencode/           agent-facing skill for the CLI
 calliope-web/                SvelteKit frontend
+calliope-cli.bat             CLI entry point (Windows)
 example_ComfyUI_workflows/   ready-to-import API-format workflow JSONs
 docs/wiki/                   design notes (wiki source): ComfyUI HTTP vs MCP, multi-ref workflows
 ```

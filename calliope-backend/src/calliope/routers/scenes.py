@@ -19,12 +19,15 @@ from calliope.models.schemas import (
     SceneReorder,
     SceneUpdate,
 )
+from calliope.queue import chain
 
 router = APIRouter()
 
 
 def _clip_public(clip_row) -> dict[str, Any]:
     clip = row_to_dict(clip_row)
+    # Legacy column: continue-from-previous was removed — never surface it.
+    clip.pop("chain_from_prev", None)
     raw_settings = clip.pop("video_settings_json", None)
     if raw_settings:
         try:
@@ -54,6 +57,8 @@ def _clips_for_scene(conn, scene_id: int) -> list[dict[str, Any]]:
 
 def _scene_with_chars(conn, scene_row, *, with_clips: bool = True) -> dict[str, Any]:
     scene = row_to_dict(scene_row)
+    # Legacy column: continue-from-previous was removed — never surface it.
+    scene.pop("chain_from_prev", None)
     chars = conn.execute(
         """
         SELECT c.id, c.name, c.role, c.portrait_path, c.sheet_path
@@ -316,8 +321,8 @@ async def create_clip(project_id: int, scene_id: int, payload: ClipCreate) -> di
             """
             INSERT INTO clips (scene_id, project_id, order_index, description, shot_size,
                                dialog_lines_covered, duration_sec, workflow_id,
-                               video_settings_json, chain_from_prev)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               video_settings_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scene_id,
@@ -329,7 +334,6 @@ async def create_clip(project_id: int, scene_id: int, payload: ClipCreate) -> di
                 payload.duration_sec,
                 payload.workflow_id,
                 json.dumps(payload.video_settings) if payload.video_settings else None,
-                1 if payload.chain_from_prev else 0,
             ),
         )
         conn.commit()
@@ -356,6 +360,11 @@ async def update_clip(project_id: int, clip_id: int, payload: ClipUpdate) -> dic
         if covered is not None:
             data["dialog_lines_covered"] = json.dumps(covered) if covered else None
         if video_settings is not None:
+            # The form autosaves the whole dict from its cached copy; the
+            # worker's chain keys (latent path, continuation) must survive it.
+            video_settings = chain.keep_server_owned(
+                video_settings, chain.read_settings(conn, clip_id)
+            )
             data["video_settings_json"] = json.dumps(video_settings)
         fields = [f"{k} = :{k}" for k in data]
         params: dict[str, Any] = {"id": clip_id, **data}
@@ -363,6 +372,10 @@ async def update_clip(project_id: int, clip_id: int, payload: ClipUpdate) -> dic
             conn.execute(
                 f"UPDATE clips SET {', '.join(fields)} WHERE id = :id", params
             )
+        if data.get("clip_path"):
+            # Render history made an older job's output current: its latent
+            # and continuation facts come with it.
+            chain.activate_render(conn, clip_id, data["clip_path"])
         conn.commit()
         row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
         return _clip_public(row)

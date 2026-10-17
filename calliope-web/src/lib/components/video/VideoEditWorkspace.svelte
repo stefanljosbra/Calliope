@@ -7,9 +7,10 @@
 	import type { Clip, Job, Scene, Workflow } from '$lib/api';
 	import OmniComposer from '$lib/components/OmniComposer.svelte';
 	import type { AssetOption } from '$lib/assetPicker';
+	import { carryValuesAcrossWorkflows, sanitizeWorkflowValues } from '$lib/comfy/carryValues';
+	import { LATENT_IN, normalizeInputRole } from '$lib/comfy/parser';
 	import Icon from '$lib/components/ui/Icon.svelte';
 	import ClipMonitor from './ClipMonitor.svelte';
-	import ClipSourceModal from './ClipSourceModal.svelte';
 	import JobInputsDrawer from './JobInputsDrawer.svelte';
 	import PromptPreviewModal from './PromptPreviewModal.svelte';
 	import SceneFilmstrip, { type FilmstripClip } from './SceneFilmstrip.svelte';
@@ -22,21 +23,6 @@ import { t } from '$lib/i18n.svelte';
 	interface Progress {
 		progress?: number;
 		message?: string;
-	}
-
-	interface ClipSourceOption {
-		/** Scene id as string, or the 'auto' / 'upload' sentinels. */
-		id: string;
-		label: string;
-		/** Clip path — the source modal renders video thumbnails when present. */
-		path?: string;
-	}
-
-	interface ClipSourceConfig {
-		/** Only offered when the scene continues from the previous video and the workflow can accept it. */
-		enabled: boolean;
-		value: string;
-		options: ClipSourceOption[];
 	}
 
 	interface Props {
@@ -61,17 +47,9 @@ import { t } from '$lib/i18n.svelte';
 		formValues: Record<string, string | number>;
 		assetOptions: AssetOption[];
 		allowUpload?: boolean;
-		/** Disable Generate: clip continues from the previous video but the workflow cannot accept it. */
-		generateDisabled?: boolean;
-		generateDisabledReason?: string;
-	/** Where this continue clip's video input comes from (auto / upload / a timeline clip). */
-	clipSource?: ClipSourceConfig;
-	onClipSourceChange?: (value: string) => void;
-	/** Upload file picked in the source modal — caller opens the file dialog. */
-	onClipSourceUpload?: () => void;
-	/** HITL prompt review before Generate: caller resolves + shows the modal. */
-	onPreviewPrompt?: () => void;
-	generateLabel?: string;
+		/** HITL prompt review before Generate: caller resolves + shows the modal. */
+		onPreviewPrompt?: () => void;
+		generateLabel?: string;
 		submitting?: boolean;
 		statusOfClip: (clipId: number) => string;
 		thumbForClip: (clipId: number) => Thumb;
@@ -84,6 +62,8 @@ import { t } from '$lib/i18n.svelte';
 	/** Render-history versioning: apply an older job's output to the clip. */
 	onApplyToClip?: (job: Job, path: string) => void;
 	applying?: boolean;
+	/** H3 motion-context chains: the clip's "Start a new chain here" toggle. */
+	onChainStartChange?: (clipId: number, value: boolean) => void;
 	}
 
 	let {
@@ -104,11 +84,6 @@ import { t } from '$lib/i18n.svelte';
 		formValues = $bindable(),
 		assetOptions,
 		allowUpload = true,
-		generateDisabled = false,
-		generateDisabledReason = '',
-		clipSource,
-		onClipSourceChange,
-		onClipSourceUpload,
 		onPreviewPrompt,
 		generateLabel = '',
 		submitting = false,
@@ -122,9 +97,37 @@ import { t } from '$lib/i18n.svelte';
 		onGenerate,
 		onApplyToClip,
 		applying = false,
+		onChainStartChange,
 	}: Props = $props();
 
-	let clipSourceOpen = $state(false);
+	// --- H3 motion-context chain (only for workflows with a Load Latent slot) ---
+	// Checked by class as well as schema: a workflow imported before the latent
+	// kind existed carries kind "image" in its stored schema.
+	const hasLatentInput = $derived(
+		Boolean(
+			workflow &&
+				(workflow.input_schema.some(
+					(i) => i.kind === 'latent' || normalizeInputRole(i.role) === 'latent',
+				) ||
+					Object.values(workflow.workflow_json ?? {}).some((n) => LATENT_IN.has(n?.class_type))),
+		),
+	);
+	/** The clip before the selected one in playback order (what it continues). */
+	const prevClip = $derived.by(() => {
+		if (!selectedClip) return null;
+		const i = filmClips.findIndex((c) => c.clip.id === selectedClip.clip.id);
+		return i > 0 ? filmClips[i - 1] : null;
+	});
+	const chainStart = $derived(!prevClip || selectedClip?.clip.video_settings?.chain_start === true);
+	/** Rendered as a continuation, but not of the previous clip's current render. */
+	const chainStale = $derived.by(() => {
+		const vs = selectedClip?.clip.video_settings;
+		if (!vs || chainStart || !prevClip || !selectedClip?.clip.clip_path) return false;
+		if (vs.continued_from_clip_id == null) return false;
+		const prevJob = prevClip.clip.video_settings?.latent_job_id ?? null;
+		return vs.continued_from_clip_id !== prevClip.clip.id || vs.continued_from_job_id !== prevJob;
+	});
+
 	let inputsOpen = $state(false);
 
 	const hasJobPayload = $derived(
@@ -134,15 +137,6 @@ import { t } from '$lib/i18n.svelte';
 					job.payload?.input_values),
 		),
 	);
-
-	/** The label shown on the Video source trigger. */
-	const clipSourceLabel = $derived.by(() => {
-		if (!clipSource?.enabled) return '';
-		const val = clipSource.value;
-		if (val === 'auto') return t('clipSource.autoName');
-		if (val === 'upload') return t('clipSource.uploadName');
-		return clipSource.options.find((o) => o.id === val)?.label ?? t('clipSource.autoName');
-	});
 </script>
 
 <div class="workspace">
@@ -177,41 +171,9 @@ import { t } from '$lib/i18n.svelte';
 
 	<aside class="dock-col" aria-label={t('videoEdit.dockAria')}>
 		{#if workflow}
-			{#if generateDisabled}
-				<div class="continue-warning" role="alert">
-					<Icon name="alert" size={16} />
-					<div class="continue-warning-text">
-						<span class="continue-warning-title">{t('videoEdit.noVideoInputWf')}</span>
-						<span>{t('videoEdit.continueHint')}</span>
-					</div>
-				</div>
-			{:else if clipSource?.enabled}
-<div class="clip-source-row">
-				<span class="clip-source-label" id="clip-source-label">{t('videoEdit.videoSource')}</span>
-				<button
-					type="button"
-					class="clip-source-trigger"
-					aria-haspopup="dialog"
-					aria-expanded={clipSourceOpen}
-					aria-labelledby="clip-source-label clip-source-value"
-					onclick={() => (clipSourceOpen = true)}
-				>
-					<Icon name="film" size={14} />
-					<span id="clip-source-value" class="clip-source-value">{clipSourceLabel}</span>
-					<Icon name="chevron-down" size={12} />
-				</button>
-			</div>
-			<ClipSourceModal
-				bind:open={clipSourceOpen}
-				value={clipSource.value}
-				options={clipSource.options}
-				onselect={(source) => onClipSourceChange?.(source)}
-				onupload={() => onClipSourceUpload?.()}
-			/>
-		{/if}
-		{#if assetOptions.length === 0}
-			<p class="asset-hint">{t('videoEdit.assetHint')}</p>
-		{/if}
+			{#if assetOptions.length === 0}
+				<p class="asset-hint">{t('videoEdit.assetHint')}</p>
+			{/if}
 		{#if hasJobPayload}
 			<div class="job-inputs-row">
 				<button
@@ -231,8 +193,14 @@ import { t } from '$lib/i18n.svelte';
 				jobs={clipJobs}
 				{workflow}
 				sceneVideoPath={selectedClip?.clip.clip_path ?? selected.video_path}
-				onCopySettings={(values) => {
-					formValues = { ...formValues, ...values };
+				onCopySettings={(values, jobWorkflowId) => {
+					// A job from another workflow keys its values by THAT workflow's nodeIds.
+					const source =
+						jobWorkflowId != null && jobWorkflowId !== workflow?.id
+							? workflows.find((w) => w.id === jobWorkflowId)?.input_schema
+							: workflow?.input_schema;
+					const copied = carryValuesAcrossWorkflows(values, source, workflow?.input_schema);
+					formValues = sanitizeWorkflowValues({ ...formValues, ...copied }, workflow?.input_schema);
 					onFormChange?.({ ...formValues });
 				}}
 				onApplyToScene={(j, path) => onApplyToClip?.(j, path)}
@@ -247,6 +215,32 @@ import { t } from '$lib/i18n.svelte';
 					{formatClock}
 				/>
 			{/if}
+			{#if hasLatentInput && selectedClip}
+				<div class="chain-row" role="group" aria-label={t('chain.aria')}>
+					<p class="chain-note">
+						<Icon name="film" size={14} />
+						{chainStart
+							? t('chain.starts')
+							: t('chain.continues', { label: prevClip?.label ?? '' })}
+					</p>
+					<label class="chain-toggle">
+						<input
+							type="checkbox"
+							checked={chainStart}
+							disabled={!prevClip}
+							onchange={(e) =>
+								onChainStartChange?.(selectedClip.clip.id, e.currentTarget.checked)}
+						/>
+						<span>{t('chain.startHere')}</span>
+					</label>
+					{#if chainStale}
+						<p class="chain-stale" role="status">
+							<Icon name="info" size={14} />
+							{t('chain.stale', { label: prevClip?.label ?? '' })}
+						</p>
+					{/if}
+				</div>
+			{/if}
 			<OmniComposer
 				inputs={workflow.input_schema}
 				bind:values={formValues}
@@ -257,8 +251,6 @@ import { t } from '$lib/i18n.svelte';
 				{allowUpload}
 				generateLabel={generateLabel || t('videoEdit.generateLabel')}
 				{submitting}
-				disabled={generateDisabled}
-				generateDisabledHint={generateDisabledReason}
 				onChange={onFormChange}
 				onSubmit={onPreviewPrompt ?? onGenerate}
 			/>
@@ -274,6 +266,31 @@ import { t } from '$lib/i18n.svelte';
 </div>
 
 <style>
+	.chain-row {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: 8px 10px;
+		border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+		border-radius: 8px;
+		font-size: 12px;
+	}
+	.chain-note,
+	.chain-stale {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin: 0;
+	}
+	.chain-stale {
+		color: var(--warning, #b7791f);
+	}
+	.chain-toggle {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		cursor: pointer;
+	}
 	/* Two columns: the player + strip own the left, every generation input
 	   lives in the right inspector so it can't push the player out of view. */
 	.workspace {
@@ -335,84 +352,6 @@ import { t } from '$lib/i18n.svelte';
 			flex: 0 0 auto;
 			overflow: visible;
 		}
-	}
-
-	.continue-warning {
-		display: flex;
-		align-items: flex-start;
-		gap: 10px;
-		padding: 10px 12px;
-		margin: 0;
-		border-radius: var(--radius-md);
-		border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
-		background: color-mix(in srgb, var(--warning) 10%, var(--bg-surface));
-		color: var(--text-secondary);
-		font-size: 13px;
-	}
-
-	.continue-warning :global(svg) {
-		flex-shrink: 0;
-		margin-top: 2px;
-		color: var(--warning);
-	}
-
-	.continue-warning-text {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-
-	.continue-warning-title {
-		font-weight: 650;
-		color: var(--text-primary);
-	}
-
-	.clip-source-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		margin: 0;
-	}
-
-	.clip-source-label {
-		font-size: 12px;
-		color: var(--text-secondary);
-		white-space: nowrap;
-	}
-
-	.clip-source-trigger {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		max-width: 100%;
-		min-width: 0;
-		padding: 6px 12px;
-		font: inherit;
-		font-size: 13px;
-		color: var(--text-primary);
-		background: var(--bg-elevated);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
-		cursor: pointer;
-	}
-
-	.clip-source-trigger:hover {
-		border-color: var(--text-muted);
-	}
-
-	.clip-source-trigger:focus-visible {
-		outline: 2px solid var(--accent);
-		outline-offset: 2px;
-	}
-
-	.clip-source-trigger :global(svg:last-child) {
-		color: var(--text-muted);
-	}
-
-	.clip-source-value {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
 	}
 
 	.asset-hint {

@@ -9,12 +9,42 @@ const TEXT_AREA = new Set([
 	'PrimitiveString',
 ]);
 const NUMBER = new Set(['INT', 'FLOAT', 'PrimitiveInt', 'PrimitiveFloat', 'KSampler', 'KSamplerAdvanced']);
+const BOOLEAN = new Set(['PrimitiveBoolean']);
 const IMAGE = new Set(['LoadImage', 'ImageLoader', 'ETN_LoadImageBase64']);
 const IMAGE_URL = new Set(['Load Image From Url (mtb)']);
 const AUDIO = new Set(['LoadAudio', 'VHS_LoadAudio']);
 const VIDEO = new Set(['LoadVideo', 'VHS_LoadVideo', 'VHS_LoadVideoPath']);
+// Mirrors LATENT_INPUT_CLASSES / LATENT_OUTPUT_CLASSES in the backend registry:
+// ComfyUI-H3-Motion-Context's latent pair, filled by Calliope at run time. Listed
+// so "LoadLatent" never reaches the "load" → image fallback.
+export const LATENT_IN = new Set(['MiniMaxH3MotionContextLoadLatent']);
+const LATENT_OUT = new Set(['MiniMaxH3MotionContextSaveLatent']);
 const VIDEO_OUT = new Set(['VHS_VideoCombine', 'SaveVideo', 'VideoOutput', 'AnimateDiffCombine']);
-const IMAGE_OUT = new Set(['SaveImage', 'PreviewImage', 'SaveImageWebsocket', 'ETN_SendImageWebSocket']);
+const IMAGE_OUT = new Set([
+	'SaveImage',
+	'SaveImageAdvanced',
+	'PreviewImage',
+	'SaveImageWebsocket',
+	'ETN_SendImageWebSocket',
+]);
+// Mirrors PROMPT_CLASSES in calliope-backend/src/calliope/comfyui/registry.py.
+// The substring fallback below matches "image"/"video" in the class name first,
+// which mis-renders these as media pickers instead of prompt fields.
+const PROMPT_CLASS = new Set([
+	'MiniMaxH3ImageToVideo',
+	'MiniMaxH3ReferenceToVideo',
+	'TextEncodeQwenImage21',
+	'TextEncodeQwenImage',
+	'TextGenerate',
+]);
+// Mirrors NEUTRAL_CLASSES in the backend registry.
+const NEUTRAL_CLASS = new Set([
+	'CCTechClipProjLoader',
+	'UnetLoaderGGUF',
+	'QwenImage21Cache',
+	'ForceUnloadBeforeDecode',
+	'GetVideoComponents',
+]);
 
 /** Matches (Input), (Input:prompt), (Output:image), … */
 const TITLE_TAG_RE = /\((Input|Output)(?::([a-zA-Z0-9_-]+))?\)/i;
@@ -31,11 +61,13 @@ const INPUT_ROLE_ALIASES: Record<string, string[]> = {
 	audio: ['audio', 'sound', 'sfx'],
 	seed: ['seed'],
 	duration: ['duration', 'dur', 'length', 'seconds'],
+	latent: ['latent'],
 };
 
 const OUTPUT_ROLE_ALIASES: Record<string, string[]> = {
 	image: ['image', 'img'],
 	video: ['video', 'vid'],
+	latent: ['latent'],
 };
 
 export function parseTitleTag(title: string): {
@@ -72,12 +104,16 @@ export function normalizeOutputRole(role: string | null | undefined): string | n
 }
 
 function classToInputKind(classType: string): ComfyDynamicInput['kind'] {
+	if (LATENT_IN.has(classType)) return 'latent';
 	if (IMAGE.has(classType)) return 'image';
 	if (IMAGE_URL.has(classType)) return 'image_url';
 	if (AUDIO.has(classType)) return 'audio';
 	if (VIDEO.has(classType)) return 'video';
+	if (BOOLEAN.has(classType) || classType.toLowerCase().includes('boolean')) return 'boolean';
 	if (NUMBER.has(classType)) return 'number';
 	if (TEXT_AREA.has(classType)) return 'textarea';
+	if (PROMPT_CLASS.has(classType)) return 'textarea';
+	if (NEUTRAL_CLASS.has(classType)) return 'text';
 	const lower = classType.toLowerCase();
 	if (lower.includes('video')) return 'video';
 	if (lower.includes('audio')) return 'audio';
@@ -87,9 +123,24 @@ function classToInputKind(classType: string): ComfyDynamicInput['kind'] {
 	return 'text';
 }
 
-function extractDefault(node: WorkflowNode): string | number | undefined {
+/** Real JSON boolean widget. `value` wins; otherwise the sole bool key. */
+function boolWidgetKey(inputs: Record<string, unknown>): string | null {
+	const keys = Object.entries(inputs)
+		.filter(([, current]) => typeof current === 'boolean')
+		.map(([key]) => key);
+	if (keys.includes('value')) return 'value';
+	if (keys.length === 1) return keys[0];
+	return null;
+}
+
+function extractDefault(node: WorkflowNode): string | number | boolean | undefined {
 	const { inputs, class_type } = node;
 	if (IMAGE.has(class_type) || AUDIO.has(class_type) || VIDEO.has(class_type)) return undefined;
+	if (LATENT_IN.has(class_type)) return undefined;
+	// typeof true === 'boolean', not 'number' — check before the number branch
+	// or a boolean default is dropped and the form never sees false.
+	const widget = boolWidgetKey(inputs);
+	if (widget) return inputs[widget] as boolean;
 	if (typeof inputs.text === 'string') return inputs.text;
 	if (typeof inputs.value === 'string' || typeof inputs.value === 'number') return inputs.value;
 	if (typeof inputs.int === 'number') return inputs.int;
@@ -103,11 +154,12 @@ export function parseDynamicInputs(workflow: Record<string, WorkflowNode>): Comf
 		const title = node._meta?.title ?? '';
 		const { kind, role, label } = parseTitleTag(title);
 		if (kind !== 'input') continue;
+		const widget = boolWidgetKey(node.inputs ?? {});
 		results.push({
 			nodeId,
 			label: label || node.class_type,
 			role: normalizeInputRole(role),
-			kind: classToInputKind(node.class_type),
+			kind: widget ? 'boolean' : classToInputKind(node.class_type),
 			defaultValue: extractDefault(node),
 			required: true,
 		});
@@ -123,7 +175,8 @@ export function parseDynamicOutputs(workflow: Record<string, WorkflowNode>): Com
 		if (kind !== 'output') continue;
 		const canon = normalizeOutputRole(role);
 		let outKind: ComfyDynamicOutput['kind'] = 'other';
-		if (canon === 'video' || VIDEO_OUT.has(node.class_type) || node.class_type.toLowerCase().includes('video'))
+		if (canon === 'latent' || LATENT_OUT.has(node.class_type)) outKind = 'latent';
+		else if (canon === 'video' || VIDEO_OUT.has(node.class_type) || node.class_type.toLowerCase().includes('video'))
 			outKind = 'video';
 		else if (
 			canon === 'image' ||

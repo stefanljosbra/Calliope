@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 
@@ -650,9 +651,11 @@ def scene_video_prompt(scene: dict[str, Any], characters: list[dict[str, Any]]) 
 # MiniMax H3 full-reference (ref2video) prompt profile
 # ---------------------------------------------------------------------------
 # Condensed from MiniMax's VIDEO_PROMPT_WRITING_GUIDE_ref_en.md, adapted to
-# Calliope's single-scene clips: each subject's reference image is wired into
-# the workflow's generic (Input:image) slots in node-id order, and that order
-# defines the <Subject N> / <Picture N> numbering below.
+# Calliope's single-scene clips. Image slots are (Input:image) in node-id
+# order and that order is <Subject N> / <Picture N>. The files the user put
+# in those slots are the identity source; story text only fills an empty
+# slot. Reference VIDEOS are a workflow wiring concern ((Input:video) nodes,
+# e.g. extend workflows) — the prompt text never mentions them.
 
 MINIMAX_H3_REF_SYSTEM = (
     "You rewrite scene descriptions into MiniMax H3's full-reference video prompt format. "
@@ -667,20 +670,27 @@ MINIMAX_H3_REF_SYSTEM = (
     "non_diegetic_music:\n"
     "\n"
     "Rules:\n"
-    "1. subject_definitions: one line per referenced subject supplied in the user message, "
+    "1. subject_definitions: one line per referenced image supplied in the user message, "
     "keeping its exact <Subject N> index. Form: '<Subject N> is the <description> in "
     "<Picture N>, with <key visual features to preserve>.' <Picture N> is the reference "
-    "image wired to slot N — cite it inside the subject line, never as a standalone entry.\n"
+    "image wired to slot N — cite it inside the subject line, never as a standalone entry. "
+    "Describe what is actually in that picture: face, hair, wardrobe, armor, weapons, "
+    "colors, body, and setting. When a picture is attached, those pixels win over the "
+    "story names. Do not replace a supplied image with a story character or location "
+    "that is not that file. If a subject has no written appearance and you cannot see "
+    "the picture, lock the line to the picture and do not invent a different identity.\n"
     "2. summary: one short English paragraph starting with '[reference generation]' that "
     "states what happens using the <Subject N> labels.\n"
     "3. retention_analysis: one line per subject: '<Subject N> (appears in [Shot 1]…): "
-    "fully_preserved - <which defined features are retained>.'\n"
-    "4. detailed_description: the main body, 120–300 words. Open with one or two style "
+    "fully_preserved - <which defined features are retained>.' Every line uses one of "
+    "H3's fixed visual markers — fully_preserved, partially_preserved, attribute_transfer, "
+    "weak_reference — and no other word.\n"
+    "4. detailed_description: the main body, 150–350 words. Open with one or two style "
     "sentences (lighting, palette, medium) BEFORE '[Shot 1]'. '[Shot 1]' has no timestamp; "
     "later cuts use '[Shot N] At MM:SS.mmm, …'. For clips under ~8 seconds prefer a single "
-    "shot. Introduce each <Subject N> at its first visible appearance with its referenced "
-    "features, position, and action; reuse the label afterwards. Describe only what is "
-    "visible except sound/dialogue.\n"
+    "shot. Introduce each <Subject N> at its first visible appearance with the features "
+    "visible in its picture, plus position and action; reuse the label afterwards. Describe "
+    "only what is visible except sound/dialogue.\n"
     "5. Dialogue: give each speaker a stable ID in order of first speech — '<Subject N> (S1) "
     "says, <d>[English] …</d>'. A speaker with no defined subject uses a stable voice "
     "description, e.g. 'A narrator (S2) says, <d>[English] …</d>'. Keep the original "
@@ -694,55 +704,102 @@ MINIMAX_H3_REF_SYSTEM = (
 def _subject_roster_lines(subjects: list[dict[str, Any]]) -> str:
     lines = []
     for s in subjects:
+        appearance = (s.get("appearance") or "").strip()
+        if not appearance:
+            appearance = (
+                f"no written description — describe Picture {s['index']} from the "
+                "attached image; do not substitute another character or location"
+            )
+        file_bit = ""
+        path = str(s.get("path") or "").strip()
+        if path:
+            file_bit = f", file {Path(path).name}"
         lines.append(
             f"<Subject {s['index']}> = {s['kind']} \"{s.get('name') or 'unnamed'}\" "
-            f"(reference image slot {s['index']}): {s.get('appearance') or 'no description'}"
+            f"(reference image slot {s['index']}{file_bit}): {appearance}"
         )
     return "\n".join(lines)
 
 
 def build_minimax_h3_ref_messages(
-    scene: dict[str, Any], subjects: list[dict[str, Any]]
-) -> list[dict[str, str]]:
+    scene: dict[str, Any],
+    subjects: list[dict[str, Any]],
+    media_parts: list[dict[str, Any]] | None = None,
+    continuity: str | None = None,
+) -> list[dict[str, Any]]:
     """LLM messages that rewrite a scene into H3's six-section ref format.
 
-    subjects: ordered roster — index N corresponds to ref image slot N.
+    subjects: ordered image roster — index N is ref image slot N.
+    media_parts: optional vision parts (picture labels + image_url frames)
+    appended after the text so a vision model sees the actual files.
     """
     roster = _subject_roster_lines(subjects) or (
         "(no reference images — describe subjects from the action text)"
     )
+    lock = (continuity or "").strip()
+    lock_block = ""
+    if lock:
+        lock_block = (
+            "\nContinuity ledger (binding — phrase these facts into the six "
+            "sections; do not recast a subject, move a dialogue line, or change "
+            "lighting or screen direction):\n"
+            f"{lock}\n"
+        )
     user = f"""Rewrite this scene into MiniMax H3 full-reference format.
 
+The reference images below are what the user wired into this clip.
+They decide who is on screen. The scene action decides
+what happens. When a picture disagrees with a story name, the
+file wins. Be specific about visible clothing, armor, weapons, face, hair, and colors.
+{lock_block}
 Scene heading: {scene.get('heading') or '(none)'}
 Scene duration: ~{scene.get('duration_sec') or 6} seconds
 
-Action (visual base for detailed_description):
+Action (what happens — not a replacement for the reference files):
 {scene.get('action') or '(none)'}
 
 Dialogue (raw 'SPEAKER: line' format; optional '(delivery cue)' after the speaker —
 map speakers to subjects by name and keep cues as delivery direction):
 {scene.get('dialog') or '(none)'}
 
-Referenced subjects (keep these exact indices):
+Referenced images (keep these exact <Subject N> indices; Picture N is image N):
 {roster}
 """
+    content: str | list[dict[str, Any]] = user
+    if media_parts:
+        content = [{"type": "text", "text": user}, *media_parts]
     return [
         {"role": "system", "content": MINIMAX_H3_REF_SYSTEM},
-        {"role": "user", "content": user},
+        {"role": "user", "content": content},
     ]
 
 
-def minimax_h3_ref_fallback(scene: dict[str, Any], subjects: list[dict[str, Any]]) -> str:
-    """Deterministic six-section H3 prompt — used when the LLM rewrite fails."""
+def minimax_h3_ref_fallback(
+    scene: dict[str, Any],
+    subjects: list[dict[str, Any]],
+) -> str:
+    """Deterministic six-section H3 prompt — the fast default compile.
+
+    No LLM: the story text (heading, action, covered dialogue) and the subject
+    roster are assembled directly, so preview and enqueue never wait on a
+    model. The LLM rewrite is an explicit Regenerate on top of this baseline.
+    """
     defs = []
     retention = []
     for s in subjects:
         name = s.get("name") or "unnamed"
         desc = (s.get("appearance") or "").strip()
-        defs.append(
-            f"<Subject {s['index']}> is the {s['kind']} \"{name}\" in "
-            f"<Picture {s['index']}>" + (f", {desc}." if desc else ".")
-        )
+        if desc:
+            defs.append(
+                f"<Subject {s['index']}> is the {s['kind']} \"{name}\" in "
+                f"<Picture {s['index']}>, {desc}."
+            )
+        else:
+            defs.append(
+                f"<Subject {s['index']}> is the reference image in "
+                f"<Picture {s['index']}> (\"{name}\"). Preserve its visible identity, "
+                "wardrobe, proportions, and materials."
+            )
         retention.append(
             f"<Subject {s['index']}> (appears in [Shot 1]): fully_preserved - "
             f"the referenced appearance of \"{name}\" is retained."
@@ -751,11 +808,10 @@ def minimax_h3_ref_fallback(scene: dict[str, Any], subjects: list[dict[str, Any]
     heading = (scene.get("heading") or "").strip()
     action = (scene.get("action") or "").strip()
     labels = ", ".join(f"<Subject {s['index']}>" for s in subjects)
-    summary = (
-        f"[reference generation] {heading or 'A scene'} featuring {labels}."
-        if labels
-        else f"[reference generation] {heading or 'A scene'}."
-    )
+    if labels:
+        summary = f"[reference generation] {heading or 'A scene'} featuring {labels}."
+    else:
+        summary = f"[reference generation] {heading or 'A scene'}."
 
     body = (
         "The target video is in a cinematic style consistent with the reference images, "
