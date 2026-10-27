@@ -233,7 +233,7 @@ async def update_scene(project_id: int, scene_id: int, payload: SceneUpdate) -> 
         # video_settings arrives as a dict — the generic UPDATE path below only
         # handles scalars, so serialize it into its JSON column (or NULL it).
         video_settings = data.pop("video_settings", None)
-        data = {k: v for k, v in data.items() if v is not None}
+        data = {k: v for k, v in data.items() if v is not None or k == "location_id"}
         if data:
             fields = ", ".join(f"{k} = :{k}" for k in data)
             data["id"] = scene_id
