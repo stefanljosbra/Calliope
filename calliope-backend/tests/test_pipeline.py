@@ -344,6 +344,35 @@ def test_story_replace_clears_scene_locations(client, monkeypatch):
         conn.close()
 
 
+def test_scene_patch_updates_and_clears_assigned_assets(client):
+    pid = client.post("/api/projects", json={"title": "Scene assets"}).json()["id"]
+    character = client.post(
+        f"/api/projects/{pid}/characters", json={"name": "Maya"}
+    ).json()
+    location = client.post(
+        f"/api/projects/{pid}/locations", json={"name": "Metro"}
+    ).json()
+    scene = client.post(
+        f"/api/projects/{pid}/scenes", json={"order_index": 1, "heading": "INT. METRO"}
+    ).json()
+
+    r = client.patch(
+        f"/api/projects/{pid}/scenes/{scene['id']}",
+        json={"character_ids": [character["id"]], "location_id": location["id"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["character_ids"] == [character["id"]]
+    assert r.json()["location_id"] == location["id"]
+
+    r = client.patch(
+        f"/api/projects/{pid}/scenes/{scene['id']}",
+        json={"character_ids": [], "location_id": None},
+    )
+    assert r.status_code == 200
+    assert r.json()["character_ids"] == []
+    assert r.json()["location_id"] is None
+
+
 def test_story_seeds_items(client, monkeypatch):
     async def fake_structured(messages, temperature=0.7):
         return {

@@ -141,6 +141,8 @@
 				action: editing!.action,
 				dialog: editing!.dialog,
 				duration_sec: editing!.duration_sec,
+				character_ids: editing!.character_ids,
+				location_id: editing!.location_id,
 			}),
 		onSuccess: () => {
 			editing = null;
@@ -207,6 +209,44 @@
 		if (img) img.style.display = 'none';
 	}
 
+	function characterForEdit(id: number) {
+		return (
+			$assetsQuery.data?.characters.find((character) => character.id === id) ??
+			editing?.characters.find((character) => character.id === id)
+		);
+	}
+
+	function locationForEdit(id: number) {
+		return $assetsQuery.data?.locations.find((location) => location.id === id);
+	}
+
+	function addSceneCharacter(value: string) {
+		const id = Number(value);
+		if (
+			!editing ||
+			!Number.isInteger(id) ||
+			id <= 0 ||
+			editing.character_ids.includes(id)
+		)
+			return;
+		editing.character_ids = [...editing.character_ids, id];
+	}
+
+	function removeSceneCharacter(id: number) {
+		if (editing) {
+			editing.character_ids = editing.character_ids.filter((characterId) => characterId !== id);
+		}
+	}
+
+	function noAvailableCharacters(): boolean {
+		const scene = editing;
+		const assets = $assetsQuery.data;
+		if (!scene || !assets) return true;
+		return assets.characters.every((character) =>
+			scene.character_ids.includes(character.id),
+		);
+	}
+
 	function formatClock(sec: number): string {
 		const s = Math.max(0, Math.round(sec));
 		const m = Math.floor(s / 60);
@@ -233,7 +273,12 @@
 	}
 
 	function openEdit(scene: Scene) {
-		editing = { ...scene };
+		editing = {
+			...scene,
+			character_ids: [
+				...(scene.character_ids ?? scene.characters.map((character) => character.id)),
+			],
+		};
 		editOpen = true;
 	}
 
@@ -545,6 +590,97 @@
 				<span class="field-label">{t('script.durationField')}</span>
 				<input class="field-input" type="number" bind:value={editing.duration_sec} min="1" />
 			</label>
+			<section class="asset-section" aria-labelledby="scene-assets-heading">
+				<h3 id="scene-assets-heading">{t('script.assetsField')}</h3>
+				<div class="chips asset-chips">
+					{#each editing.character_ids as characterId (characterId)}
+						{@const character = characterForEdit(characterId)}
+						{#if character}
+							{@const avatar = avatarFor(character)}
+							<span class="chip">
+								<span class="avatar">
+									<span class="initials" aria-hidden="true">{initialsOf(character.name)}</span>
+									{#if avatar}
+										<img src={avatar} alt="" onerror={hideBrokenAvatar} />
+									{/if}
+								</span>
+								{character.name}
+								<button
+									type="button"
+									class="remove-asset"
+									aria-label={t('script.removeCharacter', { name: character.name })}
+									title={t('script.removeCharacter', { name: character.name })}
+									disabled={$saveMutation.isPending}
+									onclick={() => removeSceneCharacter(characterId)}
+								>
+									<Icon name="close" size={12} />
+								</button>
+							</span>
+						{/if}
+					{/each}
+					{#if editing.location_id != null}
+						{@const location = locationForEdit(editing.location_id)}
+						<span class="chip">
+							<Icon name="folder" size={12} />
+							{location?.name ?? t('script.locationUnavailable')}
+							<button
+								type="button"
+								class="remove-asset"
+								aria-label={t('script.removeLocation')}
+								title={t('script.removeLocation')}
+								disabled={$saveMutation.isPending}
+								onclick={() => (editing!.location_id = null)}
+							>
+								<Icon name="close" size={12} />
+							</button>
+						</span>
+					{/if}
+					{#if editing.character_ids.length === 0 && editing.location_id == null}
+						<p class="asset-empty">{t('script.noAssetsAssigned')}</p>
+					{/if}
+				</div>
+				<div class="asset-add">
+					<label class="field">
+						<span class="field-label">{t('script.addCharacter')}</span>
+						<select
+							class="field-select"
+							disabled={$saveMutation.isPending ||
+								noAvailableCharacters()}
+							onchange={(event) => {
+								addSceneCharacter(event.currentTarget.value);
+								event.currentTarget.value = '';
+							}}
+						>
+							<option value="">{t('script.selectCharacter')}</option>
+							{#each $assetsQuery.data?.characters ?? [] as character (character.id)}
+								{#if !editing.character_ids.includes(character.id)}
+									<option value={character.id}>{character.name}</option>
+								{/if}
+							{/each}
+						</select>
+					</label>
+					<label class="field">
+						<span class="field-label">{t('script.addLocation')}</span>
+						<select
+							class="field-select"
+							disabled={$saveMutation.isPending ||
+								!$assetsQuery.data ||
+								$assetsQuery.data.locations.length === 0}
+							value=""
+							onchange={(event) => {
+								const id = Number(event.currentTarget.value);
+								if (editing && Number.isInteger(id) && id > 0) editing.location_id = id;
+								event.currentTarget.value = '';
+							}}
+						>
+							<option value="">{t('script.selectLocation')}</option>
+							{#each $assetsQuery.data?.locations ?? [] as location (location.id)}
+								<option value={location.id}>{location.name}</option>
+							{/each}
+						</select>
+					</label>
+				</div>
+			</section>
 		</div>
 	{/if}
 	{#snippet footer()}
@@ -590,6 +726,56 @@
 	.edit-scene-form .grow :global(.field-textarea) {
 		flex: 1;
 		min-height: 120px;
+	}
+	.asset-section {
+		border-top: 1px solid var(--border);
+		padding-top: var(--space-md);
+		margin-top: var(--space-sm);
+	}
+	.asset-section h3 {
+		margin: 0;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+	.asset-chips {
+		margin-top: 8px;
+	}
+	.asset-add {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+		gap: 12px;
+		margin-top: 12px;
+	}
+	.asset-add .field {
+		margin-bottom: 0;
+	}
+	.remove-asset {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 20px;
+		height: 20px;
+		margin: 0 -6px 0 0;
+		padding: 0;
+		border: 0;
+		border-radius: 50%;
+		background: transparent;
+		color: var(--text-muted);
+		cursor: pointer;
+	}
+	.remove-asset:hover:not(:disabled) {
+		background: var(--bg-surface);
+		color: var(--text-primary);
+	}
+	.remove-asset:disabled {
+		cursor: wait;
+		opacity: 0.6;
+	}
+	.asset-empty {
+		margin: 0;
+		font-size: 12px;
+		color: var(--text-muted);
 	}
 	.stage-header {
 		/* Pins inside the stage scroll container so Add Scene / Regenerate
