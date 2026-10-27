@@ -512,35 +512,40 @@
 <Modal
 	bind:open={editOpen}
 	title={editing ? t('script.editSceneNumbered', { n: editing.order_index }) : t('script.editScene')}
+	size="wide"
+	closeOnBackdrop={false}
+	resizable
 	onclose={() => (editing = null)}
 >
 	{#if editing}
-		<label class="field">
-			<span class="field-label">{t('script.headingField')}</span>
-			<input class="field-input" bind:value={editing.heading} placeholder={t('script.headingPlaceholder')} />
-		</label>
-		<label class="field">
-			<span class="field-label">{t('script.actionField')}</span>
-			<textarea
-				class="field-textarea"
-				bind:value={editing.action}
-				rows="4"
-				placeholder={t('script.actionPlaceholder')}
-			></textarea>
-		</label>
-		<label class="field">
-			<span class="field-label">{t('script.dialogField')}</span>
-			<textarea
-				class="field-textarea"
-				bind:value={editing.dialog}
-				rows="4"
-				placeholder={t('script.dialogPlaceholder')}
-			></textarea>
-		</label>
-		<label class="field">
-			<span class="field-label">{t('script.durationField')}</span>
-			<input class="field-input" type="number" bind:value={editing.duration_sec} min="1" />
-		</label>
+		<div class="edit-scene-form">
+			<label class="field">
+				<span class="field-label">{t('script.headingField')}</span>
+				<input class="field-input" bind:value={editing.heading} placeholder={t('script.headingPlaceholder')} />
+			</label>
+			<label class="field grow">
+				<span class="field-label">{t('script.actionField')}</span>
+				<textarea
+					class="field-textarea"
+					bind:value={editing.action}
+					rows="6"
+					placeholder={t('script.actionPlaceholder')}
+				></textarea>
+			</label>
+			<label class="field grow">
+				<span class="field-label">{t('script.dialogField')}</span>
+				<textarea
+					class="field-textarea"
+					bind:value={editing.dialog}
+					rows="6"
+					placeholder={t('script.dialogPlaceholder')}
+				></textarea>
+			</label>
+			<label class="field">
+				<span class="field-label">{t('script.durationField')}</span>
+				<input class="field-input" type="number" bind:value={editing.duration_sec} min="1" />
+			</label>
+		</div>
 	{/if}
 	{#snippet footer()}
 		<Button variant="ghost" onclick={() => (editOpen = false)}>{t('common.cancel')}</Button>
@@ -569,6 +574,23 @@
 />
 
 <style>
+	.edit-scene-form {
+		display: flex;
+		flex-direction: column;
+		min-height: 100%;
+		height: 100%;
+	}
+	.edit-scene-form .grow {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		min-height: 0;
+		margin-bottom: var(--space-md);
+	}
+	.edit-scene-form .grow :global(.field-textarea) {
+		flex: 1;
+		min-height: 120px;
+	}
 	.stage-header {
 		/* Pins inside the stage scroll container so Add Scene / Regenerate
 		   stay reachable while scrolling long scripts. */
