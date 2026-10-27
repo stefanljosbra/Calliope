@@ -143,6 +143,7 @@
 				duration_sec: editing!.duration_sec,
 				character_ids: editing!.character_ids,
 				location_id: editing!.location_id,
+				item_ids: editing!.item_ids ?? [],
 			}),
 		onSuccess: () => {
 			editing = null;
@@ -220,6 +221,13 @@
 		return $assetsQuery.data?.locations.find((location) => location.id === id);
 	}
 
+	function itemForEdit(id: number) {
+		return (
+			$assetsQuery.data?.items.find((item) => item.id === id) ??
+			editing?.items?.find((item) => item.id === id)
+		);
+	}
+
 	function addSceneCharacter(value: string) {
 		const id = Number(value);
 		if (
@@ -235,6 +243,19 @@
 	function removeSceneCharacter(id: number) {
 		if (editing) {
 			editing.character_ids = editing.character_ids.filter((characterId) => characterId !== id);
+		}
+	}
+
+	function addSceneItem(value: string) {
+		const id = Number(value);
+		if (!editing || !Number.isInteger(id) || id <= 0 || (editing.item_ids ?? []).includes(id))
+			return;
+		editing.item_ids = [...(editing.item_ids ?? []), id];
+	}
+
+	function removeSceneItem(id: number) {
+		if (editing) {
+			editing.item_ids = (editing.item_ids ?? []).filter((itemId) => itemId !== id);
 		}
 	}
 
@@ -278,6 +299,7 @@
 			character_ids: [
 				...(scene.character_ids ?? scene.characters.map((character) => character.id)),
 			],
+			item_ids: [...(scene.item_ids ?? scene.items?.map((item) => item.id) ?? [])],
 		};
 		editOpen = true;
 	}
@@ -635,7 +657,24 @@
 							</button>
 						</span>
 					{/if}
-					{#if editing.character_ids.length === 0 && editing.location_id == null}
+					{#each editing.item_ids ?? [] as itemId (itemId)}
+						{@const item = itemForEdit(itemId)}
+						<span class="chip">
+							<Icon name="folder" size={12} />
+							{item?.name ?? t('script.itemUnavailable')}
+							<button
+								type="button"
+								class="remove-asset"
+								aria-label={t('script.removeItem', { name: item?.name ?? t('script.itemUnavailable') })}
+								title={t('script.removeItem', { name: item?.name ?? t('script.itemUnavailable') })}
+								disabled={$saveMutation.isPending}
+								onclick={() => removeSceneItem(itemId)}
+							>
+								<Icon name="close" size={12} />
+							</button>
+						</span>
+					{/each}
+					{#if editing.character_ids.length === 0 && editing.location_id == null && (editing.item_ids ?? []).length === 0}
 						<p class="asset-empty">{t('script.noAssetsAssigned')}</p>
 					{/if}
 				</div>
@@ -677,6 +716,27 @@
 							{#each $assetsQuery.data?.locations ?? [] as location (location.id)}
 								{#if editing.location_id !== location.id}
 									<option value={location.id}>{location.name}</option>
+								{/if}
+							{/each}
+						</select>
+					</label>
+					<label class="field">
+						<span class="field-label">{t('script.addItem')}</span>
+						<select
+							class="field-select"
+							disabled={$saveMutation.isPending ||
+								!$assetsQuery.data ||
+								$assetsQuery.data.items.length === 0 ||
+								editing.item_ids?.length === $assetsQuery.data?.items.length}
+							onchange={(event) => {
+								addSceneItem(event.currentTarget.value);
+								event.currentTarget.value = '';
+							}}
+						>
+							<option value="">{t('script.selectItem')}</option>
+							{#each $assetsQuery.data?.items ?? [] as item (item.id)}
+								{#if !(editing.item_ids ?? []).includes(item.id)}
+									<option value={item.id}>{item.name}</option>
 								{/if}
 							{/each}
 						</select>

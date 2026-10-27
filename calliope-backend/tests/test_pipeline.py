@@ -352,25 +352,36 @@ def test_scene_patch_updates_and_clears_assigned_assets(client):
     location = client.post(
         f"/api/projects/{pid}/locations", json={"name": "Metro"}
     ).json()
+    item = client.post(
+        f"/api/projects/{pid}/items", json={"name": "Old camera"}
+    ).json()
     scene = client.post(
         f"/api/projects/{pid}/scenes", json={"order_index": 1, "heading": "INT. METRO"}
     ).json()
 
     r = client.patch(
         f"/api/projects/{pid}/scenes/{scene['id']}",
-        json={"character_ids": [character["id"]], "location_id": location["id"]},
+        json={
+            "character_ids": [character["id"]],
+            "location_id": location["id"],
+            "item_ids": [item["id"]],
+        },
     )
     assert r.status_code == 200
     assert r.json()["character_ids"] == [character["id"]]
     assert r.json()["location_id"] == location["id"]
+    assert r.json()["item_ids"] == [item["id"]]
+    assert r.json()["items"][0]["name"] == "Old camera"
 
     r = client.patch(
         f"/api/projects/{pid}/scenes/{scene['id']}",
-        json={"character_ids": [], "location_id": None},
+        json={"character_ids": [], "location_id": None, "item_ids": []},
     )
     assert r.status_code == 200
     assert r.json()["character_ids"] == []
     assert r.json()["location_id"] is None
+    assert r.json()["item_ids"] == []
+    assert r.json()["items"] == []
 
 
 def test_story_seeds_items(client, monkeypatch):
