@@ -591,7 +591,7 @@
 				<input class="field-input" type="number" bind:value={editing.duration_sec} min="1" />
 			</label>
 			<section class="asset-section" aria-labelledby="scene-assets-heading">
-				<h3 id="scene-assets-heading">{t('script.assetsField')}</h3>
+				<span id="scene-assets-heading" class="field-label">{t('script.assetsField')}</span>
 				<div class="chips asset-chips">
 					{#each editing.character_ids as characterId (characterId)}
 						{@const character = characterForEdit(characterId)}
@@ -675,7 +675,9 @@
 						>
 							<option value="">{t('script.selectLocation')}</option>
 							{#each $assetsQuery.data?.locations ?? [] as location (location.id)}
-								<option value={location.id}>{location.name}</option>
+								{#if editing.location_id !== location.id}
+									<option value={location.id}>{location.name}</option>
+								{/if}
 							{/each}
 						</select>
 					</label>
@@ -728,15 +730,7 @@
 		min-height: 120px;
 	}
 	.asset-section {
-		border-top: 1px solid var(--border);
-		padding-top: var(--space-md);
 		margin-top: var(--space-sm);
-	}
-	.asset-section h3 {
-		margin: 0;
-		font-size: 13px;
-		font-weight: 600;
-		color: var(--text-primary);
 	}
 	.asset-chips {
 		margin-top: 8px;
