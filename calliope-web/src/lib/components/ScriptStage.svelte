@@ -564,6 +564,9 @@
 							{c.name}
 						</span>
 					{/each}
+					{#each scene.items ?? [] as item (item.id)}
+						<span class="chip"><Icon name="folder" size={12} /> {item.name}</span>
+					{/each}
 					{#if locName}
 						<span class="chip"><Icon name="folder" size={12} /> {locName}</span>
 					{/if}
