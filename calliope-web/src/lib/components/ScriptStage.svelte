@@ -185,10 +185,10 @@
 		return { status: 'idle', label: t('script.status.noClip') };
 	}
 
-	function locationName(scene: Scene): string | null {
+	function locationForScene(scene: Scene) {
 		if (scene.location_id == null) return null;
 		const locs = $assetsQuery.data?.locations ?? [];
-		return locs.find((l) => l.id === scene.location_id)?.name ?? null;
+		return locs.find((location) => location.id === scene.location_id) ?? null;
 	}
 
 	function avatarFor(char: { portrait_path: string | null; sheet_path: string | null }) {
@@ -436,7 +436,7 @@
 	{:else}
 		{#each scenes as scene, i (scene.id)}
 			{@const st = sceneStatus(scene)}
-			{@const locName = locationName(scene)}
+			{@const location = locationForScene(scene)}
 			<article
 				id="scene-{scene.id}"
 				class="card scene"
@@ -565,10 +565,36 @@
 						</span>
 					{/each}
 					{#each scene.items ?? [] as item (item.id)}
-						<span class="chip"><Icon name="folder" size={12} /> {item.name}</span>
+						<span class="chip">
+							<span class="avatar">
+								<Icon name="folder" size={12} />
+								{#if item.reference_image_path}
+									<img
+										src={assetUrl(item.reference_image_path)}
+										alt=""
+										loading="lazy"
+										onerror={hideBrokenAvatar}
+									/>
+								{/if}
+							</span>
+							{item.name}
+						</span>
 					{/each}
-					{#if locName}
-						<span class="chip"><Icon name="folder" size={12} /> {locName}</span>
+					{#if location}
+						<span class="chip">
+							<span class="avatar">
+								<Icon name="folder" size={12} />
+								{#if location.reference_image_path}
+									<img
+										src={assetUrl(location.reference_image_path)}
+										alt=""
+										loading="lazy"
+										onerror={hideBrokenAvatar}
+									/>
+								{/if}
+							</span>
+							{location.name}
+						</span>
 					{/if}
 					{#if scene.duration_sec}
 						<span class="chip"><Icon name="clock" size={12} /> {formatClock(scene.duration_sec)}</span>
@@ -646,7 +672,16 @@
 					{#if editing.location_id != null}
 						{@const location = locationForEdit(editing.location_id)}
 						<span class="chip">
-							<Icon name="folder" size={12} />
+							<span class="avatar">
+								<Icon name="folder" size={12} />
+								{#if location?.reference_image_path}
+									<img
+										src={assetUrl(location.reference_image_path)}
+										alt=""
+										onerror={hideBrokenAvatar}
+									/>
+								{/if}
+							</span>
 							{location?.name ?? t('script.locationUnavailable')}
 							<button
 								type="button"
@@ -663,7 +698,16 @@
 					{#each editing.item_ids ?? [] as itemId (itemId)}
 						{@const item = itemForEdit(itemId)}
 						<span class="chip">
-							<Icon name="folder" size={12} />
+							<span class="avatar">
+								<Icon name="folder" size={12} />
+								{#if item?.reference_image_path}
+									<img
+										src={assetUrl(item.reference_image_path)}
+										alt=""
+										onerror={hideBrokenAvatar}
+									/>
+								{/if}
+							</span>
 							{item?.name ?? t('script.itemUnavailable')}
 							<button
 								type="button"
