@@ -4,13 +4,13 @@ Calliope is a local-first story-to-video studio. You type a story idea; Calliope
 
 <img width="2003" height="1093" alt="Screenshot 2026-09-06 050058" src="https://github.com/user-attachments/assets/27771fac-3ad2-47c3-9d4a-78cfa6f41f91" />
 
-
 <img width="1358" height="725" alt="Screenshot 2026-09-05 234659" src="https://github.com/user-attachments/assets/8319981e-6994-4492-bccf-1654b4579260" />
 
 <img width="1508" height="1131" alt="Screenshot 2026-08-23 192042" src="https://github.com/user-attachments/assets/61cb10fb-a8a2-4096-beff-e504a8f7c8df" />
 
 <img width="1976" height="1154" alt="Screenshot 2026-09-13 025721" src="https://github.com/user-attachments/assets/b58fcecf-b6be-41ac-91d8-9f0df2fd8f21" />
 
+<img width="1813" height="1070" alt="Screenshot 2026-10-18 041011" src="https://github.com/user-attachments/assets/dccb82c8-f06d-42d3-939b-34f1e684c892" />
 
 ## Demo
 
@@ -52,7 +52,14 @@ Open `http://127.0.0.1:5173`. The dev server proxies `/api` to the backend on `1
 Open the app, go to **Settings**, and set:
 
 1. **LLM** — one or more OpenAI-compatible endpoints (base URL, model name, API key). Save several, then pick which one is **Active**.
-2. **ComfyUI** — the base URL of your running ComfyUI (e.g. `http://127.0.0.1:8188`)
+2. **ComfyUI** — the base URL of your running ComfyUI (e.g. `http://127.0.0.1:8188`). Workflow jobs go through the Comfy SDK to `comfy-api-proxy` (default `http://127.0.0.1:8189`, **Settings → Comfy → Comfy API URL**). With ComfyUI already on 8188:
+
+```bash
+pip install comfy-api-proxy
+comfy-api-proxy --comfyui http://127.0.0.1:8188 --port 8189
+```
+
+Comfy Router is optional. Save a Comfy API key under **Settings → Comfy**, turn on **Use Comfy API provider (Router)**, and the video and asset pickers offer MiniMax H3 and FLUX 3. No key, or the switch left off, means every job stays on your local workflow.
 3. **Agent** *(optional)* — assign a specific LLM per agent role (see below)
 
 Leave **Dry-run** off — it is meant for testing and produces placeholder results instead of real generations.
